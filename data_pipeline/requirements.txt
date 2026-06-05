@@ -1,0 +1,11 @@
+apache-airflow==2.9.3
+folktables==0.0.12
+polars==1.6.0
+pyarrow==17.0.0
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1
+pyyaml==6.0.2
+duckdb==1.1.0
+sdv==1.36.3
