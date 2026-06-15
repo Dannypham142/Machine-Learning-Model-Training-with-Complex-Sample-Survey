@@ -112,8 +112,14 @@ def _fill_nulls(frame, feats: cfg.FeaturesConfig, cols: set[str]):
             continue
         if spec.dtype == "categorical":
             exprs.append(pl.col(spec.name).fill_null("NA"))
-        elif spec.dtype in ("int", "float"):
-            exprs.append(pl.col(spec.name).fill_null(-1))
+        elif spec.dtype == "int":
+            exprs.append(
+                pl.col(spec.name).fill_null(
+                    pl.col(spec.name).mean().round(0).cast(pl.Int64)
+                )
+            )
+        elif spec.dtype == "float":
+            exprs.append(pl.col(spec.name).fill_null(pl.col(spec.name).mean()))
     if exprs:
         frame = frame.with_columns(exprs)
     return frame

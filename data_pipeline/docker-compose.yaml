@@ -1,5 +1,5 @@
 # Airflow Celery stack — per-state SDV fanout across workers.
-# Mode is fixed by DATA_PIPELINE_MODE in .env (full | test).
+# Mode is fixed by DATA_PIPELINE_MODE in .env (sample | train | test).
 # Scale workers horizontally:
 #   docker compose up -d --scale airflow-worker=8
 x-airflow-common: &airflow-common
@@ -24,7 +24,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     PYTHONPATH: "/opt/airflow/src"
     DATA_PIPELINE_OUTPUT_ROOT: "/opt/airflow/data"
-    DATA_PIPELINE_MODE: "${DATA_PIPELINE_MODE:-full}"
+    DATA_PIPELINE_MODE: "${DATA_PIPELINE_MODE:-train}"
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src

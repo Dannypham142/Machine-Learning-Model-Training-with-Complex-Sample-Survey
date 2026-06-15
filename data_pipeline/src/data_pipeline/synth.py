@@ -122,8 +122,10 @@ def generate_state(
 ) -> Path:
     """
     Fit an SDV GaussianCopulaSynthesizer on every source row for this state
-    and sample `c.synthetic_rows_per_state` synthetic rows. Returns the
-    partition path.
+    and sample either `c.synthetic_rows_per_state` rows (fixed-count modes:
+    sample/train) or `state_population.json[state_code] // 10` rows (test
+    mode, where `c.synthetic_rows_per_state is None` → 1/10 of sum(PWGTP);
+    full population OOMed on the dev host). Returns the partition path.
     """
     import time
 
@@ -145,7 +147,11 @@ def generate_state(
         if isinstance(train[col].dtype, pd.CategoricalDtype):
             train[col] = train[col].astype("object")
     n_train = len(train)
-    n_synth = c.synthetic_rows_per_state
+
+    state_pop_map = json.loads((io_utils.run_dir(run_id) / STATE_POPULATION_FILE).read_text())
+    state_population = int(state_pop_map[state_code])
+    # test mode samples sum(PWGTP) // 10 per state — full population was OOMing on this host.
+    n_synth = c.synthetic_rows_per_state if c.synthetic_rows_per_state is not None else state_population // 10
 
     feats = cfg.load_features_config()
     spec_by_name = {s.name: s for s in feats.synthesized()}
@@ -171,14 +177,12 @@ def generate_state(
     num_cols = syn_df.select_dtypes(include="number").columns
     obj_cols = syn_df.columns.difference(num_cols)
     if len(num_cols):
-        syn_df[num_cols] = syn_df[num_cols].fillna(-1)
+        syn_df[num_cols] = syn_df[num_cols].fillna(train[num_cols].mean())
     if len(obj_cols):
         syn_df[obj_cols] = syn_df[obj_cols].fillna("NA")
 
     syn_df["ST"] = state_code
-
-    state_pop_map = json.loads((io_utils.run_dir(run_id) / STATE_POPULATION_FILE).read_text())
-    syn_df["state_population"] = int(state_pop_map[state_code])
+    syn_df["state_population"] = state_population
 
     syn_df.to_parquet(part, engine="pyarrow", compression="snappy", index=False)
 

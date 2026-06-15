@@ -2,9 +2,8 @@
     python logstic_regression.py --mode train /path/to/train.parquet
     python logstic_regression.py --mode test  /path/to/test.parquet
 
-Train fits a standard and a survey-weighted logistic regression on the whole input
-and logs both via mlflow.sklearn. Test pulls the most recent of each from the
-tracking store and writes a labeled parquet to ./data/.
+Train fits a standard and a survey-weighted logistic regression on input.
+Test passes through data to output a labeled parquet file containing features and designed prediction labels for control and treatment group.
 """
 import argparse
 import os
@@ -33,6 +32,8 @@ TRACKING_URI = os.environ.get(
 
 p = argparse.ArgumentParser()
 p.add_argument("--mode", choices=("train", "test"), required=True)
+p.add_argument("--threshold", type=float, default=0.5,
+               help="test-mode decision threshold on predict_proba (default 0.5)")
 p.add_argument("input")
 args = p.parse_args()
 
@@ -42,6 +43,7 @@ mlflow.set_experiment(EXPERIMENT)
 df = pl.read_parquet(args.input)
 w = df[WEIGHT].to_numpy().astype(np.float64)
 X = df.drop([TARGET, TARGET_NEG, WEIGHT]).to_numpy()
+y = df[TARGET].to_numpy().astype(np.int8)
 
 
 def score(y, pred, prob, sw=None):
@@ -54,14 +56,14 @@ def score(y, pred, prob, sw=None):
     }
 
 
-if args.mode == "train":
-    y = df[TARGET].to_numpy().astype(np.int8)
+if args.mode == "train": # Training a model to be logged into MlFlow
     for variant in VARIANTS:
-        with mlflow.start_run(run_name=variant):
+        with mlflow.start_run(run_name=f"{variant}_train"):
             mlflow.log_params({
                 "variant": variant,
                 "model": "LogisticRegression",
                 "max_iter": 1000,
+                "class_weight": "balanced",
                 "weight_col": WEIGHT,
                 "target": TARGET,
                 "n_rows": len(y),
@@ -70,7 +72,9 @@ if args.mode == "train":
             })
 
             sw = w if variant == "survey_weighted" else None
-            clf = LogisticRegression(max_iter=1000, solver="lbfgs").fit(X, y, sample_weight=sw)
+            clf = LogisticRegression(
+                max_iter=1000, solver="lbfgs", class_weight="balanced",
+            ).fit(X, y, sample_weight=sw)
             pred = clf.predict(X)
             prob = clf.predict_proba(X)[:, 1]
             for name, val in score(y, pred, prob).items():
@@ -78,28 +82,43 @@ if args.mode == "train":
             for name, val in score(y, pred, prob, sw=w).items():
                 mlflow.log_metric(f"train_weighted_{name}", float(val))
 
-            mlflow.sklearn.log_model(clf, name="model")
-            print(f"logged {variant}")
+            mlflow.sklearn.log_model(clf, name=variant)
 
-else:
+elif args.mode == "test": # Load most recent LR model and loging model parameters and metrics into MlFlow
     client = mlflow.MlflowClient()
     exp = client.get_experiment_by_name(EXPERIMENT)
 
     out_cols = {}
     for variant in VARIANTS:
-        runs = client.search_runs(
+        models = client.search_logged_models(
             experiment_ids=[exp.experiment_id],
-            filter_string=f"tags.`mlflow.runName` = '{variant}'",
-            order_by=["start_time DESC"],
+            filter_string=f"name='{variant}'",
+            order_by=[{"field_name": "creation_timestamp", "ascending": False}],
             max_results=1,
         )
-        uri = f"runs:/{runs[0].info.run_id}/model"
+        if not models:
+            raise SystemExit(f"no logged model named {variant!r} in experiment {EXPERIMENT}")
+        uri = f"models:/{models[0].model_id}"
         clf = mlflow.sklearn.load_model(uri)
-        out_cols[f"predicted_disability_{variant}"] = clf.predict(X).astype(np.int8)
-        print(f"loaded {variant} <- {uri}")
+        prob = clf.predict_proba(X)[:, 1]
+        pred = (prob >= args.threshold).astype(np.int8)
+        out_cols[f"predicted_disability_{variant}"] = pred
+
+        with mlflow.start_run(run_name=f"{variant}_test"):
+            mlflow.log_params({
+                "variant": variant,
+                "model_uri": uri,
+                "threshold": args.threshold,
+                "input": args.input,
+                "n_rows": len(y),
+                "n_features": X.shape[1],
+            })
+            for name, val in score(y, pred, prob).items():
+                mlflow.log_metric(f"test_unweighted_{name}", float(val))
+            for name, val in score(y, pred, prob, sw=w).items():
+                mlflow.log_metric(f"test_weighted_{name}", float(val))
 
     out_dir = Path("./data")
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{Path(args.input).stem}_labeled.parquet"
     df.with_columns([pl.Series(n, v) for n, v in out_cols.items()]).write_parquet(out)
-    print(f"wrote {out}")

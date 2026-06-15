@@ -1,7 +1,10 @@
 """
-Two modes, specified via DATA_PIPELINE_MODE env var (5,000 samples per state):
-  - "full" (default): 50 states
-  - "test": single-state test (WY)
+Three modes, specified via DATA_PIPELINE_MODE env var:
+  - "train" (default): 50 states, 5,000 synthetic rows per state (canonical training output)
+  - "sample": single-state smoke run (WY), 5,000 synthetic rows
+  - "test": 50 states, synthetic rows per state = sum(PWGTP) // 10 for that
+           state (full population OOMed on dev host; row count resolved per-state
+           at synth time from state_population.json — see synth.generate_state)
 """
 import os
 from dataclasses import dataclass
@@ -20,7 +23,9 @@ class DAGConfig:
     acs: ACSConfig
     random_seed: int
     output_root: str
-    synthetic_rows_per_state: int 
+    # None = match per-state population (sum of PWGTP) read from state_population.json.
+    # Concrete int = fixed sample count regardless of training size.
+    synthetic_rows_per_state: int | None
 
 
 @dataclass(frozen=True)
@@ -46,26 +51,35 @@ class FeaturesConfig:
         return list(self.features)
 
 
-CONFIG_FULL = DAGConfig(
+CONFIG_TRAIN = DAGConfig(
     acs=ACSConfig(year=2023, horizon="5-Year", survey="person", states=["ALL"]),
     random_seed=42,
     output_root="/opt/airflow/data",
     synthetic_rows_per_state=5000,
 )
 
-CONFIG_TEST = DAGConfig(
+CONFIG_SAMPLE = DAGConfig(
     acs=ACSConfig(year=2023, horizon="5-Year", survey="person", states=["WY"]),
     random_seed=42,
     output_root="/opt/airflow/data",
     synthetic_rows_per_state=5000,
 )
 
+CONFIG_TEST = DAGConfig(
+    acs=ACSConfig(year=2023, horizon="5-Year", survey="person", states=["ALL"]),
+    random_seed=42,
+    output_root="/opt/airflow/data",
+    synthetic_rows_per_state=None,
+)
+
 
 def load_dag_config() -> DAGConfig:
-    mode = os.environ.get("DATA_PIPELINE_MODE", "full").lower()
+    mode = os.environ.get("DATA_PIPELINE_MODE", "train").lower()
+    if mode == "sample":
+        return CONFIG_SAMPLE
     if mode == "test":
         return CONFIG_TEST
-    return CONFIG_FULL
+    return CONFIG_TRAIN
 
 
 VISIT_SEQUENCE = [
