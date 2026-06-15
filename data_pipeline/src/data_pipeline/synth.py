@@ -122,13 +122,9 @@ def generate_state(
 ) -> Path:
     """
     Fit an SDV GaussianCopulaSynthesizer on every source row for this state
-    and sample either `c.synthetic_rows_per_state` rows (fixed-count modes:
-    sample/train) or `state_population.json[state_code] // 10` rows (test
-    mode, where `c.synthetic_rows_per_state is None` → 1/10 of sum(PWGTP);
-    full population OOMed on the dev host). Returns the partition path.
+    and sample `c.synthetic_rows_per_state` for sample/train mode 
+    or `state_population.json[state_code] / 10` rows for test mode.
     """
-    import time
-
     import pandas as pd
     from sdv.metadata import SingleTableMetadata
     from sdv.single_table import GaussianCopulaSynthesizer
@@ -140,7 +136,6 @@ def generate_state(
     seed = c.random_seed + (abs(hash(state_code)) % 10_000)
     np.random.seed(seed)
 
-    t0 = time.time()
     train = pd.read_parquet(training_path)
 
     for col in train.columns:
@@ -166,13 +161,8 @@ def generate_state(
         metadata.add_column(col, sdtype=sdtype)
 
     synth = GaussianCopulaSynthesizer(metadata, default_distribution="norm")
-    t1 = time.time()
     synth.fit(train)
-    fit_s = time.time() - t1
-
-    t2 = time.time()
     syn_df = synth.sample(num_rows=n_synth)
-    sample_s = time.time() - t2
 
     num_cols = syn_df.select_dtypes(include="number").columns
     obj_cols = syn_df.columns.difference(num_cols)
@@ -193,9 +183,6 @@ def generate_state(
         "synth_rows": n_synth,
         "training_path": str(training_path),
         "synthesizer": "sdv.GaussianCopulaSynthesizer",
-        "fit_elapsed_s": round(fit_s, 2),
-        "sample_elapsed_s": round(sample_s, 2),
-        "total_elapsed_s": round(time.time() - t0, 2),
     })
     return part
 
