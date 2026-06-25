@@ -23,14 +23,14 @@ docker run -it --rm \
 Drop the parquet from `data_pipeline` into `ml_pipeline/data/`
 
 ```bash
-# Process data before passing into model
-python data_processing.py data/_full.parquet data/train.parquet
+# Process data before passing into model for {train | test}
+python data_processing.py data/_full.parquet data/{}.parquet
 
-# Train both variants (standard + survey_weighted), logged to mlflow
-python logstic_regression.py --mode train data/train.parquet
+# Train both variants (standard + survey_weighted) using  {logistic_regression.py | xgb.py | neural_network.py}
+python {}.py --mode train data/train.parquet
 
-# Run logistic regression model on test set (after running preprocessing on test set)
-python logstic_regression.py --mode test --threshold 0.5 data/test.parquet
+# Run logistic regression model on test set
+python {}.py --mode test --threshold 0.5 data/test.parquet
 
 # Browse runs
 mlflow ui --host 0.0.0.0 --port 5001   # then http://localhost:5001

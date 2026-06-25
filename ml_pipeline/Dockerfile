@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY data_processing.py logstic_regression.py pums_labels.py ./
+COPY data_processing.py logistic_regression.py neural_network.py xgb.py pums_labels.py ./
 
 EXPOSE 5001
 
