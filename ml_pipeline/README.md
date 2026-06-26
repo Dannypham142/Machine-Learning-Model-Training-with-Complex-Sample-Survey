@@ -30,7 +30,7 @@ python data_processing.py data/_full.parquet data/{}.parquet
 python {}.py --mode train data/train.parquet
 
 # Run logistic regression model on test set
-python {}.py --mode test --threshold 0.5 data/test.parquet
+python {}.py --mode test data/test.parquet
 
 # Browse runs
 mlflow ui --host 0.0.0.0 --port 5001   # then http://localhost:5001
