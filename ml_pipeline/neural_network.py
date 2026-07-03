@@ -30,13 +30,13 @@ TARGET_NEG = "Disability (recoded)_Without a disability"
 WEIGHT = "State population"
 EXPERIMENT = "neural_network_survey_weights"
 VARIANTS = ("standard", "survey_weighted")
-HIDDEN = (128, 64, 32)
-EPOCHS = 200 
+HIDDEN = (64, 32)
+DROPOUT = 0.3
+WEIGHT_DECAY = 1e-4
+EPOCHS = 15
 BATCH_SIZE = 8192
 LR = 1e-3
 SEED = 42
-EARLY_STOP_PATIENCE = 10
-EARLY_STOP_MIN_DELTA = 1e-4
 PREDICT_BATCH = 16_384
 TEST_BATCH = 50_000
 TRACKING_URI = os.environ.get(
@@ -64,12 +64,12 @@ else:
 
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden=HIDDEN):
+    def __init__(self, input_size, hidden=HIDDEN, dropout=DROPOUT):
         super().__init__()
         layers = []
         prev = input_size
         for h in hidden:
-            layers += [nn.Linear(prev, h), nn.ReLU()]
+            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
             prev = h
         layers.append(nn.Linear(prev, 1))
         self.net = nn.Sequential(*layers)
@@ -110,6 +110,7 @@ if args.mode == "train":
     X = df.drop([TARGET, TARGET_NEG, WEIGHT]).to_numpy().astype(np.float32)
     y = df[TARGET].to_numpy().astype(np.int8)
     cw = compute_sample_weight("balanced", y).astype(np.float32)
+    n = X.shape[0]
 
     for variant in VARIANTS:
         with mlflow.start_run(run_name=f"{variant}_train"):
@@ -117,6 +118,8 @@ if args.mode == "train":
                 "variant": variant,
                 "model": "PyTorchMLP",
                 "hidden_layer_sizes": str(HIDDEN),
+                "dropout": DROPOUT,
+                "weight_decay": WEIGHT_DECAY,
                 "epochs": EPOCHS,
                 "batch_size": BATCH_SIZE,
                 "lr": LR,
@@ -133,15 +136,11 @@ if args.mode == "train":
             X_t = torch.from_numpy(X).to(device)
             y_t = torch.from_numpy(y.astype(np.float32)).to(device)
             sw_t = torch.from_numpy(sw_np).to(device)
-            n = X_t.shape[0]
 
             model = MLP(X.shape[1]).to(device)
-            opt = torch.optim.Adam(model.parameters(), lr=LR)
+            opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
             model.train()
-            best_loss = float("inf")
-            patience = 0
-            trained_epochs = 0
             pbar = tqdm(range(EPOCHS), desc=f"train {variant}", unit="epoch")
             for epoch in pbar:
                 perm = torch.randperm(n, device=device)
@@ -156,17 +155,9 @@ if args.mode == "train":
                     loss_sum += loss.detach()
                     n_batches += 1
                 epoch_loss = (loss_sum / n_batches).item()
-                trained_epochs = epoch + 1
-                pbar.set_postfix(loss=f"{epoch_loss:.4f}", best=f"{best_loss:.4f}")
-                if best_loss - epoch_loss > EARLY_STOP_MIN_DELTA:
-                    best_loss = epoch_loss
-                    patience = 0
-                else:
-                    patience += 1
-                    if patience >= EARLY_STOP_PATIENCE:
-                        break
+                mlflow.log_metric("train_loss", epoch_loss, step=epoch)
+                pbar.set_postfix(loss=f"{epoch_loss:.4f}")
             pbar.close()
-            mlflow.log_metric("trained_epochs", trained_epochs)
 
             prob = predict_proba(model, X)
             pred = (prob >= 0.5).astype(np.int8)

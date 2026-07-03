@@ -29,6 +29,7 @@ WEIGHT = "State population"
 EXPERIMENT = "logistic_regression_survey_weights"
 VARIANTS = ("standard", "survey_weighted")
 BATCH = 50_000  # test-mode parquet row-batch size; keeps peak X to BATCH × n_features
+C = 0.01
 TRACKING_URI = os.environ.get(
     "MLFLOW_TRACKING_URI",
     f"file://{Path(__file__).resolve().parent / 'mlruns'}",
@@ -68,6 +69,7 @@ if args.mode == "train": # Training a model to be logged into MlFlow
                 "model": "LogisticRegression",
                 "max_iter": 1000,
                 "class_weight": "balanced",
+                "C": C,
                 "weight_col": WEIGHT,
                 "target": TARGET,
                 "n_rows": len(y),
@@ -77,7 +79,7 @@ if args.mode == "train": # Training a model to be logged into MlFlow
 
             sw = w if variant == "survey_weighted" else None
             clf = LogisticRegression(
-                max_iter=1000, solver="lbfgs", class_weight="balanced",
+                C=C, max_iter=1000, solver="lbfgs", class_weight="balanced",
             ).fit(X, y, sample_weight=sw)
             pred = clf.predict(X)
             prob = clf.predict_proba(X)[:, 1]

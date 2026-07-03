@@ -30,6 +30,9 @@ WEIGHT = "State population"
 EXPERIMENT = "xgboost_survey_weights"
 VARIANTS = ("standard", "survey_weighted")
 BATCH = 50_000  # test-mode parquet row-batch size; keeps peak X to BATCH × n_features
+N_ESTIMATORS = 100
+LEARNING_RATE = 0.1
+MAX_DEPTH = 6
 TRACKING_URI = os.environ.get(
     "MLFLOW_TRACKING_URI",
     f"file://{Path(__file__).resolve().parent / 'mlruns'}",
@@ -76,14 +79,15 @@ if args.mode == "train": # Training a model to be logged into MlFlow
     y = df[TARGET].to_numpy().astype(np.int8)
 
     scale_pos_weight = float((y == 0).sum()) / float(max(int((y == 1).sum()), 1))
+
     for variant in VARIANTS:
         with mlflow.start_run(run_name=f"{variant}_train"):
             mlflow.log_params({
                 "variant": variant,
                 "model": "XGBClassifier",
-                "n_estimators": 200,
-                "max_depth": 6,
-                "learning_rate": 0.1,
+                "n_estimators": N_ESTIMATORS,
+                "max_depth": MAX_DEPTH,
+                "learning_rate": LEARNING_RATE,
                 "scale_pos_weight": scale_pos_weight,
                 "tree_method": "hist",
                 "weight_col": WEIGHT,
@@ -95,16 +99,17 @@ if args.mode == "train": # Training a model to be logged into MlFlow
 
             sw = w if variant == "survey_weighted" else None
             clf = XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.1,
+                n_estimators=N_ESTIMATORS,
+                max_depth=MAX_DEPTH,
+                learning_rate=LEARNING_RATE,
                 scale_pos_weight=scale_pos_weight,
                 objective="binary:logistic",
                 eval_metric="logloss",
                 tree_method="hist",
                 n_jobs=-1,
-                callbacks=[TqdmCallback(total=200, desc=f"train xgb {variant}")],
+                callbacks=[TqdmCallback(total=N_ESTIMATORS, desc=f"train xgb {variant}")],
             ).fit(X, y, sample_weight=sw)
+
             prob = clf.predict_proba(X)[:, 1]
             pred = (prob >= 0.5).astype(np.int8)
             for name, val in score(y, pred, prob).items():
