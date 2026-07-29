@@ -29,7 +29,7 @@ python data_processing.py data/_full.parquet data/{}.parquet
 # Train both variants (standard + survey_weighted) using  {logistic_regression.py | xgb.py | neural_network.py}
 python {}.py --mode train data/train.parquet
 
-# Run logistic regression model on test set
+# Run models on test set
 python {}.py --mode test data/test.parquet
 
 # Browse runs

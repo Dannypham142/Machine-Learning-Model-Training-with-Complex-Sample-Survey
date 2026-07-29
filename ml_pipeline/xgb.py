@@ -1,9 +1,6 @@
 """
     python xgb.py --mode train /path/to/train.parquet
     python xgb.py --mode test  /path/to/test.parquet
-
-Train fits a standard and a survey-weighted XGBoost classifier on input.
-Test passes through data to output a labeled parquet file containing features and designed prediction labels for control and treatment group.
 """
 import argparse
 import os
@@ -18,8 +15,10 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
+    accuracy_score, f1_score, precision_recall_curve, precision_score,
+    recall_score, roc_auc_score,
 )
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import xgboost as xgb
 from xgboost import XGBClassifier
@@ -30,9 +29,9 @@ WEIGHT = "State population"
 EXPERIMENT = "xgboost_survey_weights"
 VARIANTS = ("standard", "survey_weighted")
 BATCH = 50_000  # test-mode parquet row-batch size; keeps peak X to BATCH × n_features
-N_ESTIMATORS = 100
-LEARNING_RATE = 0.1
-MAX_DEPTH = 6
+SEED = 42
+N_ITER = 20
+VAL_FRAC = 0.1
 TRACKING_URI = os.environ.get(
     "MLFLOW_TRACKING_URI",
     f"file://{Path(__file__).resolve().parent / 'mlruns'}",
@@ -40,8 +39,11 @@ TRACKING_URI = os.environ.get(
 
 p = argparse.ArgumentParser()
 p.add_argument("--mode", choices=("train", "test"), required=True)
-p.add_argument("--threshold", type=float, default=0.5,
-               help="test-mode decision threshold on predict_proba (default 0.5)")
+p.add_argument("--threshold", type=float, default=None,
+               help="test-mode decision threshold; default: each variant's "
+                    "learned best_threshold (falls back to 0.5)")
+p.add_argument("--n-iter", type=int, default=N_ITER,
+               help="random-search trials per variant (default %(default)s)")
 p.add_argument("input")
 args = p.parse_args()
 
@@ -72,23 +74,98 @@ def score(y, pred, prob, sw=None):
     }
 
 
-if args.mode == "train": # Training a model to be logged into MlFlow
+def best_threshold(y, prob, sw=None):
+    # rank by AUC
+    prec, rec, thr = precision_recall_curve(y, prob, sample_weight=sw)
+    if len(thr) == 0:
+        return 0.5
+    f1 = np.divide(2 * prec * rec, prec + rec,
+                   out=np.zeros_like(prec), where=(prec + rec) > 0)
+    return float(thr[int(np.argmax(f1[:-1]))])
+
+
+def sample_params(rng, balanced_spw):
+    use_class_weight = bool(rng.integers(2))
+    return {
+        "n_estimators": int(rng.integers(50, 301)),
+        "max_depth": int(rng.integers(3, 11)),
+        "learning_rate": float(10 ** rng.uniform(-2, -0.5)),
+        "subsample": float(rng.uniform(0.6, 1.0)),
+        "colsample_bytree": float(rng.uniform(0.6, 1.0)),
+        "use_class_weight": use_class_weight,
+        "scale_pos_weight": balanced_spw if use_class_weight else 1.0,
+    }
+
+
+def make_clf(params, callbacks=None):
+    return XGBClassifier(
+        n_estimators=params["n_estimators"],
+        max_depth=params["max_depth"],
+        learning_rate=params["learning_rate"],
+        subsample=params["subsample"],
+        colsample_bytree=params["colsample_bytree"],
+        scale_pos_weight=params["scale_pos_weight"],
+        objective="binary:logistic",
+        eval_metric="auc",
+        tree_method="hist",
+        n_jobs=-1,
+        callbacks=callbacks,
+    )
+
+
+if args.mode == "train":
     df = pl.read_parquet(args.input)
     w = df[WEIGHT].to_numpy().astype(np.float64)
     X = df.drop([TARGET, TARGET_NEG, WEIGHT]).to_numpy()
     y = df[TARGET].to_numpy().astype(np.int8)
 
-    scale_pos_weight = float((y == 0).sum()) / float(max(int((y == 1).sum()), 1))
+    balanced_spw = float((y == 0).sum()) / float(max(int((y == 1).sum()), 1))
 
     for variant in VARIANTS:
+        Xtr, Xval, ytr, yval, wtr, wval = train_test_split(
+            X, y, w, test_size=VAL_FRAC, stratify=y, random_state=SEED)
+        tr_sw = wtr if variant == "survey_weighted" else None
+        val_sw = wval if variant == "survey_weighted" else None
+
+        rng = np.random.default_rng(SEED)
         with mlflow.start_run(run_name=f"{variant}_train"):
+            best = None  # (val_auc, params, val_prob)
+            for i in tqdm(range(args.n_iter), desc=f"search xgb {variant}", unit="trial"):
+                params = sample_params(rng, balanced_spw)
+                clf = make_clf(params).fit(Xtr, ytr, sample_weight=tr_sw)
+                val_prob = clf.predict_proba(Xval)[:, 1]
+                auc = roc_auc_score(yval, val_prob, sample_weight=val_sw)
+                with mlflow.start_run(run_name=f"{variant}_trial_{i}", nested=True):
+                    mlflow.log_params({
+                        "variant": variant,
+                        "trial": i,
+                        "n_estimators": params["n_estimators"],
+                        "max_depth": params["max_depth"],
+                        "learning_rate": params["learning_rate"],
+                        "subsample": params["subsample"],
+                        "colsample_bytree": params["colsample_bytree"],
+                        "use_class_weight": params["use_class_weight"],
+                        "scale_pos_weight": params["scale_pos_weight"],
+                    })
+                    mlflow.log_metric("val_roc_auc", float(auc))
+                if best is None or auc > best[0]:
+                    best = (auc, params, val_prob)
+            val_auc, params, val_prob = best
+            thr = best_threshold(yval, val_prob, val_sw)
+
             mlflow.log_params({
                 "variant": variant,
                 "model": "XGBClassifier",
-                "n_estimators": N_ESTIMATORS,
-                "max_depth": MAX_DEPTH,
-                "learning_rate": LEARNING_RATE,
-                "scale_pos_weight": scale_pos_weight,
+                "search": "random",
+                "n_iter": args.n_iter,
+                "n_estimators": params["n_estimators"],
+                "max_depth": params["max_depth"],
+                "learning_rate": params["learning_rate"],
+                "subsample": params["subsample"],
+                "colsample_bytree": params["colsample_bytree"],
+                "use_class_weight": params["use_class_weight"],
+                "scale_pos_weight": params["scale_pos_weight"],
+                "best_threshold": thr,
                 "tree_method": "hist",
                 "weight_col": WEIGHT,
                 "target": TARGET,
@@ -96,22 +173,16 @@ if args.mode == "train": # Training a model to be logged into MlFlow
                 "n_features": X.shape[1],
                 "input": args.input,
             })
+            mlflow.log_metric("val_roc_auc", float(val_auc))
+            mlflow.log_metric("best_threshold", float(thr))
 
-            sw = w if variant == "survey_weighted" else None
-            clf = XGBClassifier(
-                n_estimators=N_ESTIMATORS,
-                max_depth=MAX_DEPTH,
-                learning_rate=LEARNING_RATE,
-                scale_pos_weight=scale_pos_weight,
-                objective="binary:logistic",
-                eval_metric="logloss",
-                tree_method="hist",
-                n_jobs=-1,
-                callbacks=[TqdmCallback(total=N_ESTIMATORS, desc=f"train xgb {variant}")],
-            ).fit(X, y, sample_weight=sw)
+            sw_full = w if variant == "survey_weighted" else None
+            clf = make_clf(params, callbacks=[
+                TqdmCallback(total=params["n_estimators"], desc=f"train xgb {variant}")])
+            clf = clf.fit(X, y, sample_weight=sw_full)
 
             prob = clf.predict_proba(X)[:, 1]
-            pred = (prob >= 0.5).astype(np.int8)
+            pred = (prob >= thr).astype(np.int8)
             for name, val in score(y, pred, prob).items():
                 mlflow.log_metric(f"train_unweighted_{name}", float(val))
             for name, val in score(y, pred, prob, sw=w).items():
@@ -134,7 +205,9 @@ elif args.mode == "test":
         if not models:
             raise SystemExit(f"no logged model named {variant!r} in experiment {EXPERIMENT}")
         uri = f"models:/{models[0].model_id}"
-        loaded[variant] = (uri, mlflow.xgboost.load_model(uri))
+        thr = (args.threshold if args.threshold is not None
+               else float(models[0].params.get("best_threshold", 0.5)))
+        loaded[variant] = (uri, mlflow.xgboost.load_model(uri), thr)
 
     ys, ws, probs = [], [], {v: [] for v in VARIANTS}
     n_features = 0
@@ -147,23 +220,24 @@ elif args.mode == "test":
         ws.append(df_b[WEIGHT].to_numpy().astype(np.float64))
         X_b = df_b.drop([TARGET, TARGET_NEG, WEIGHT]).to_numpy()
         n_features = X_b.shape[1]
-        for v, (_, clf) in loaded.items():
+        for v, (_, clf, _) in loaded.items():
             probs[v].append(clf.predict_proba(X_b)[:, 1])
 
     y = np.concatenate(ys)
     w = np.concatenate(ws)
 
     out_cols = {}
-    for variant, (uri, _) in loaded.items():
+    for variant, (uri, _, thr) in loaded.items():
         prob = np.concatenate(probs[variant])
-        pred = (prob >= args.threshold).astype(np.int8)
+        pred = (prob >= thr).astype(np.int8)
+        out_cols[f"predicted_proba_{variant}"] = prob
         out_cols[f"predicted_disability_{variant}"] = pred
 
         with mlflow.start_run(run_name=f"{variant}_test"):
             mlflow.log_params({
                 "variant": variant,
                 "model_uri": uri,
-                "threshold": args.threshold,
+                "threshold": thr,
                 "input": args.input,
                 "n_rows": len(y),
                 "n_features": n_features,
