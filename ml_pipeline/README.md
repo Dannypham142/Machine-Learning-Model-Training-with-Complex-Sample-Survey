@@ -10,19 +10,19 @@ python3 -m venv .venv
 ## Process the data
 Drop the parquet from `data_pipeline` into `data/`, then one-hot encode and scale:
 ```bash
-.venv/bin/python data_processing.py data/_full.parquet data/test.parquet
+.venv/bin/python data_processing.py data/_full.parquet data/population.parquet
 ```
 
 ## Train + evaluate
-Trains and evaluates two variants (`standard`, `survey_weighted`). Each cycle samples 5,000 rows per state (~250k), splits into 200k train / 50k test, fits on train, then scores the test split and the rest of the population.
+Trains and evaluates two variants (`standard`, `survey_weighted`). Each round samples 5,000 rows per state (~250k), splits into 200k train / 50k test, fits on train, then scores the test split and the rest of the population. Rounds are **repeated random subsampling (Monte Carlo cross-validation), not k-fold** — each round draws a fresh independent sample and split (seeded by round index), so rounds overlap rather than partition the data; the figures notebook averages `test_*` metrics across them to smooth sampling noise.
 ```bash
-.venv/bin/python logistic_regression.py --train-test-cycles 20 --search-trials 20 data/test.parquet
-.venv/bin/python xgb.py --train-test-cycles 20 --search-trials 20 data/test.parquet
-.venv/bin/python neural_network.py --train-test-cycles 20 --search-trials 15 data/test.parquet
+.venv/bin/python logistic_regression.py --resample-rounds 20 --search-trials 20 data/test.parquet
+.venv/bin/python xgb.py --resample-rounds 20 --search-trials 20 data/test.parquet
+.venv/bin/python neural_network.py --resample-rounds 20 --search-trials 15 data/test.parquet
 ```
 
 Flags (same on all three):
-- `--train-test-cycles` *(default 5)* — sample/split/fit cycles.
+- `--resample-rounds` *(default 5)* — independent random subsampling rounds (Monte Carlo CV, not k-fold); each draws a fresh 5000-per-state sample and 200k/50k split.
 - `--search-trials` *(default 20; NN 15)* — random-search trials per variant.
 - `--threshold` — decision threshold; omit to use each variant's learned best.
 - `input` — the parquet pool to split.

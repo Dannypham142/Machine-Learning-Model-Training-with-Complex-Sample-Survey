@@ -1,0 +1,2340 @@
+# CLAUDE.md — context for future Claude sessions
+
+Working notes for the ML preprocessing side of the project. Sibling to
+`../data_pipeline` (the data generator); read that one's `CLAUDE.md` first if
+you're touching anything that depends on the source contract or the
+external-drive / macOS bind-mount quirks (they apply equally here — same
+drive, ExFAT since 2026-06-11).
+
+**Status (2026-06-10): in active iteration.** Single-script polars pipeline.
+The user is shaping it as they go and has explicitly trimmed it multiple
+times. Don't re-introduce structure (functions, helpers, multiple outputs)
+without asking. Docker was removed on 2026-08-04 — the host venv
+(`.venv`) is the only supported run mode; see "Running it" below.
+
+> Folder name is `ml_pipline` (typo), not `ml_pipeline`. The eda notebook
+> and any tooling that hardcodes a path uses the typo'd form.
+
+**Changelog convention** (per user, 2026-06-10): every edit to anything under
+`ml_pipline/` gets a dated entry at the bottom of this file. Most recent on top.
+
+## What this is
+
+ML feature prep for the synth PUMS dataset produced by `../data_pipeline`.
+Reads a parquet (by convention, the train split), one-hot encodes the
+categoricals, MinMax-scales the numerics to `[0, 1]`, writes a single
+parquet ready to feed into linear / NN / tree models.
+
+## Layout
+
+```
+ml_pipline/
+├── CLAUDE.md             ← this file (includes Changelog at bottom)
+├── data_processing.py    ← lazy polars pipeline, streams to sink_parquet
+├── logistic_regression.py← LR train/test driver (mlflow.sklearn)
+├── xgb.py                ← XGBoost train/test driver (mlflow.xgboost)
+├── neural_network.py     ← PyTorch MLP train/test driver (mlflow.pytorch)
+├── pums_labels.py        ← COLUMN_LABELS (55) + VALUE_LABELS (34 categoricals)
+├── eda.ipynb             ← source EDA; defines the source path + acs_pums_labels dict
+├── requirements.txt      ← pinned runtime deps (installed into .venv)
+├── data/                 ← input + output parquet files
+├── mlruns/               ← stale ExFAT mlflow store; live runs are in APFS (see below)
+└── .venv/                ← polars 1.6, pyarrow, torch, mlflow, sklearn, xgboost, tqdm
+```
+
+## Pipeline (`data_processing.py`)
+
+Single lazy plan, streams via `sink_parquet`. As of 2026-06-25 the whole
+pipeline is one `lf.select(...).sink_parquet(...)`:
+
+1. **Scan** parquet via `pl.scan_parquet`. Drops high-cardinality cats
+   (`OCCP`, `POWPUMA`, `FOD1P`, `MIGSP`) at scan time via projection pushdown.
+   `INDP` (266) kept by explicit user choice.
+2. **One-hot value-coded columns directly from PUMS codes.** For each col in
+   `VALUE_LABELS`, emit `(pl.col(c).cast(String) == code).cast(UInt8)
+   .alias(f"{COLUMN_LABELS[c]}_{label}")`. No intermediate string column,
+   no `Categorical` dtype, no `to_dummies`. Output column names identical
+   to the prior pipeline so downstream `TARGET = "Disability (recoded)_With
+   a disability"` references unchanged.
+3. **Other non-numeric columns** (e.g. `ST` if string-typed) one-hot from
+   observed uniques via a one-shot `unique().drop_nulls().implode()`
+   aggregation collect, then same `eq` expression pattern.
+4. **MinMax-scale numerics to [0, 1] as `Float32`**, excluding
+   `state_population` so it survives as the raw survey weight. Min/max
+   scalars are pre-computed in a one-shot aggregation
+   (`lf.select([min,max]).collect().row(0, named=True)`) so the main plan
+   is pure per-row arithmetic. **Why pre-compute:** polars 1.6's streaming
+   engine doesn't broadcast aggregations back across rows, and broadcasting
+   forces a fallback to the standard engine which then errors on
+   `sink_parquet`.
+5. **`state_population`** kept under its `"State population"` label as the
+   downstream survey weight.
+6. **Sink** to `<output>` via `sink_parquet(compression="lz4")` — fast write,
+   larger file than zstd. Swap to `"lz4_raw"` if polars rejects `"lz4"`.
+
+Output dtypes: `Float32` (scaled numerics) + `UInt8` (one-hot dummies) +
+raw `state_population`. Column-name schema identical to the previous
+`to_dummies`-based pipeline. Verified end-to-end on the 3 GB `_full.parquet`.
+
+## Running it
+
+Host venv only (Docker was removed 2026-08-04). Setup once:
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+```bash
+# 1. process the raw parquet
+.venv/bin/python data_processing.py data/_full.parquet data/test.parquet
+
+# 2. train + evaluate a model (both variants, --iterations cycles). LR/XGB
+#    default --n-iter 20; NN defaults to 15. Pass the pool to split, not a
+#    pre-split file.
+.venv/bin/python logistic_regression.py --iterations 5 --n-iter 20 data/test.parquet
+.venv/bin/python xgb.py               --iterations 5 --n-iter 20 data/test.parquet
+.venv/bin/python neural_network.py    --iterations 5 --n-iter 15 data/test.parquet
+
+# 3. browse runs (APFS store — same default the drivers now write to)
+MLFLOW_ALLOW_FILE_STORE=true .venv/bin/mlflow ui \
+  --backend-store-uri file:///Users/dpham/mlruns_ml_pipeline \
+  --port 5001   # then open http://localhost:5001
+```
+
+Notes:
+- **Runs land in the APFS store `~/mlruns_ml_pipeline`** by default (all three
+  drivers, as of 2026-08-04) to dodge the ExFAT AppleDouble `._*` crash. The
+  UI must point `--backend-store-uri` at the *same* store or it shows nothing.
+  Override both with `MLFLOW_TRACKING_URI` / `--backend-store-uri`.
+- Port 5001 because macOS AirPlay Receiver usually holds 5000. The UI binds
+  `127.0.0.1` — no `--host 0.0.0.0` needed now that there's no container.
+- `MLFLOW_ALLOW_FILE_STORE=true` is required for `mlflow ui` against a file
+  store (the drivers set it themselves via `os.environ.setdefault`).
+
+**Drive quirks** (inherited from `../data_pipeline/CLAUDE.md`, same ExFAT
+external drive — reformatted from FAT32 on 2026-06-11, so the 4 GB
+single-file cap is gone but the macOS-on-non-Apple-FS quirks below still
+apply):
+- Quirk 12: `find . -name '__pycache__' -type d -exec rm -rf {} +` after any
+  Python edit if you hit `EOFError: marshal data too short` on import. Was
+  reliably triggered on FAT32; less certain on ExFAT — keep the cleanup
+  mantra as a defensive habit until proven unnecessary.
+- Quirk 1: `find . -name '._*' -type f -delete` if AppleDouble sidecars
+  start interfering with anything. ExFAT still doesn't support xattr, so
+  macOS keeps writing `._*` companions on every save.
+
+## Source contract (don't break)
+
+The input parquet originates at `../data_pipeline/data/manual__*/synth/_full.parquet`
+(or any split thereof). Per `../data_pipeline/CLAUDE.md`:
+
+- **Null-free by construction.** If you see nulls, something broke upstream —
+  fix the data pipeline, don't add an imputer here.
+- **`-1` (numeric) and `"NA"` (categorical) are PUMS skip-pattern signal**,
+  not missingness. `WKHP=-1` means "not employed"; `FER="NA"` means "question
+  not asked of this respondent". They are real features.
+
+After MinMax scaling, a `-1` sentinel becomes `0.0` for any column whose actual
+min was `-1`. The signal is preserved as "is the smallest value" but no longer
+explicit. After one-hot, `"NA"` becomes its own column (e.g.
+`Means of transportation to work_NA`).
+
+## Decisions worth keeping straight
+
+- **Polars over pandas** (2026-06-10): user-directed swap. Same data, smaller
+  memory footprint, faster, matches `data_pipeline`'s stack. The pandas+sklearn
+  MinMaxScaler became an inline polars expression — no sklearn dependency.
+- **MinMax over Standard scaling**: user asked for "normalize"; aligning
+  numeric range with one-hot's `{0, 1}` keeps the "don't let numerics dominate"
+  argument clean. After polars swap, this is just an arithmetic expression
+  rather than a fitted transformer.
+- **Scaler is NOT persisted.** Every run recomputes min/max from the input
+  frame's rows. Train-stat consistency is not guaranteed across separate runs
+  on train/val/test. Acceptable for tree models; if linear / NN starts
+  misbehaving on held-out data, persist the min/max per column (but that
+  breaks the one-output-file rule, so ask first).
+- **`-1` sentinel handling is implicit**. Indicator columns (`<col>_skipped`)
+  were proposed and declined. Skip-pattern numerics per
+  `../data_pipeline/CLAUDE.md`: `WKHP, WKWN, JWMNP, WAGP, RETP, SSP, SSIP,
+  PAP, POVPIP, NOP`. **Don't add indicators to `SEMP, INTP, PERNP, PINCP`** —
+  those can be legitimately negative (self-employment losses, etc.).
+- **Dropped 4 high-card cats, kept INDP**: OCCP/POWPUMA/FOD1P/MIGSP are mostly
+  `"NA"` (>78% each per eda.ipynb cell 11) and one-hot would balloon column
+  count. `INDP` is similarly NA-heavy (~36%) but explicitly kept; it stays
+  coded (no `VALUE_LABELS` entry), so one-hot columns look like `Industry_4720`.
+- **No `if __name__ == "__main__"`**, no functions. The user trimmed both
+  during iteration. The script runs at import time; that's intentional, not
+  an oversight.
+- **Docker removed** (2026-08-04). The container path had drifted out of use —
+  the drivers now default their MLflow store to APFS (`~/mlruns_ml_pipeline`),
+  which doesn't exist inside a container, and every real run has been on the
+  host venv. Deleted `Dockerfile`; `requirements.txt` stays as the venv dep
+  list. If containerization is ever wanted again, restore from git history and
+  remember to override `MLFLOW_TRACKING_URI` to a bind-mounted path.
+
+## Don't
+
+- Don't impute the `-1` / `"NA"` sentinels. They are signal, not missingness.
+- Don't reintroduce one-hot for OCCP / POWPUMA / FOD1P / MIGSP without first
+  adding `VALUE_LABELS` entries — otherwise column names like `Occupation_4720`
+  are useless downstream.
+- Don't add a scaler over the one-hot columns. They're already `{0, 1}`.
+- Don't run `data_processing.py` on the int-encoded output of a prior version
+  of the script. The current script expects raw PUMS string codes; encoded
+  ints will slip past `VALUE_LABELS` silently and produce nonsense one-hot
+  columns.
+- Don't break the "one output file" contract without asking. The script
+  previously emitted train/val/test/encoder/schema and was simplified
+  deliberately. Same for re-introducing functions.
+- Don't fix the `ml_pipline` typo — the EDA notebook and downstream scripts
+  likely depend on the path.
+- Don't swap polars back to pandas. The swap was a user directive.
+- Don't re-add Docker without asking — it was removed 2026-08-04 as unused.
+  The host venv is the contract.
+- Don't point the drivers or `mlflow ui` at the ExFAT `mlruns/`; the APFS
+  store `~/mlruns_ml_pipeline` is the default now (dodges the `._*` crash).
+- Don't forget to log edits here in the Changelog section below.
+
+## Changelog
+
+### 2026-09-03 — `create_figures.ipynb`: Figs 2 & 3 share one x-axis (unweighted-driven)
+- **Coworker feedback on Figs 2 & 3:** the two graphs must be on the **same
+  scale** so "a bar of a given length means the same amount of difference in
+  both." The point to convey: **weighted test metrics are unbiased estimates of
+  population performance (gap ≤ ~0.001–0.004), unweighted ones are biased
+  (bigger gaps)** — which only reads if the weighted bars are tiny *against the
+  unweighted range*, not auto-zoomed to their own tiny range. Reviewer suggested
+  a fixed ±0.04-ish window.
+- **Root cause:** each cell computed its own `xmax` — Fig 2 (`543d79e8`) from the
+  weighted gaps (`gen_df["gap"].abs().max()`≈0.0037), Fig 3 (`fig3-cmp`) from the
+  unweighted gaps (≈0.0323). So Fig 2 was auto-zoomed and its ~0 story was
+  invisible.
+- **Fix:** one shared symmetric limit driven by the **unweighted** gaps.
+  Fig 2 now also builds the unweighted gap frame (`gen_u`, `metrics_df` filtered
+  to `weighting=="unweighted"` merged onto the same `pop_df`) and sets
+  `SHARED_XMAX = |gen_u.gap|.max() × 1.8` (≈**0.0581**, ticks −0.04…0.04); both
+  cells use `xmax = SHARED_XMAX`. Fig 3 reads the same global (runs after Fig 2;
+  already depends on Fig 1's `metric_order`/`metric_labels`, so top-to-bottom
+  order is assumed as elsewhere). Nothing else changed — same 2×3 layout, GREY
+  top / ACCENT bottom, 5-decimal labels, `off = xmax*0.02`.
+- **Result on the common scale:** weighted bars reach only **6.3%** of the axis
+  (all hug 0), unweighted reach **56%** (recall +0.021–0.032, accuracy −0.010 to
+  −0.017). Same-length ⇒ same-difference now holds across the pair.
+- **Durability:** single atomic `json.dump` write, `._*` swept first + after,
+  `sync`; re-read from disk confirms 15 cells and both cells reference
+  `SHARED_XMAX`. **Verified headless** (Agg) against the real APFS store +
+  20-iteration parquets: `SHARED_XMAX`=0.0581 identical in both, `gen_df`/
+  `gen_u_df` = 30 rows each; rendered both to PNG and eyeballed (shared
+  −0.04…0.04 ticks, weighted slivers vs filled unweighted bars, no label
+  clipping incl. left-side negative accuracy labels). Not opened in Jupyter.
+
+### 2026-09-01 — `create_figures.ipynb`: new Fig 3 — unweighted vs weighted test→population gap on one scale
+- **Coworker feedback on Fig 2:** the weighted test − unweighted population gaps
+  "are all pretty much 0, but that's harder to see" without a shared reference
+  scale — asked to **also plot the unweighted test − unweighted population gap
+  side by side** so the two sit on the same axis. Keep the unweighted/weighted
+  *model* row split (Fig 2's layout) as-is. **Additive** ("make another plot"):
+  Fig 2 is untouched.
+- **New Fig 3 inserted right after Fig 2** (markdown `md-fig3-cmp` + code
+  `fig3-cmp`); the later headers renumber by position `## Figure 3/4/5` →
+  `## Figure 4/5/6` (markdown `82535ad9`/`f0872be1`/`md-fig6`; cell order and the
+  commented state of Figs 4/5/6 unchanged). **Notebook is now 15 cells / 6
+  figures** (Figs 4/5/6 still the commented ones).
+- **What it shows.** Same 2×3 grid as Fig 2 (columns = models, top row =
+  unweighted/standard model, bottom = survey-weighted), but each metric now has
+  **grouped horizontal bars: GREY = unweighted test − unweighted population,
+  ACCENT = weighted test − unweighted population** (`h=0.38`, offset `(0.5−s)·h`).
+  Rebuilds `pop_df` (same `population_unweighted_*` query as Fig 2) and merges the
+  **full** `metrics_df` (both `weighting`s, not filtered to weighted) → `cmp_df`
+  (60 rows = 3 models × 2 variants × 2 weightings × 5 metrics), `gap = test −
+  population`. Shared symmetric x-axis `±|gap|.max()×1.45` (≈±0.047, driven by the
+  unweighted bars) so the near-zero weighted bars are legible *relative to* the
+  unweighted spread. Figure-level `Patch` legend below (Unweighted/Weighted test);
+  no per-bar value labels (grouped bars near zero would collide). Suptitle "Test
+  estimate vs. population: weighted vs. unweighted evaluation (mean over {N_ITER}
+  iterations)".
+- **Finding (makes Fig 2's point visible):** unweighted-test gaps are the movers
+  — recall +0.02–0.03, F1/ROC-AUC ~+0.004, accuracy *negative* (~−0.01, pop base
+  rate differs) — while the **weighted-test gaps hug 0 (~±0.001)** across every
+  model/metric/variant. So the survey-weighted test set is a near-unbiased
+  estimate of population performance, now readable against a common scale instead
+  of being auto-zoomed on its own tiny range.
+- **Durability:** single atomic `json.dump` write, `._*` swept first, `sync` +
+  re-read confirmed the 15-cell state stuck and headers read 1→6 sequentially.
+  **Verified headless** (Agg): setup + Fig 1 + Fig 2 + Fig 3 execute against the
+  real APFS store + 20-iteration parquets; `cmp_df` = 60 rows with the gaps above.
+  Rendered to PNG and eyeballed (2×3, grouped grey/blue bars, weighted bars near
+  zero vs wider grey, row labels, legend, no clipping). Not opened in Jupyter.
+- **Follow-up churn (same session); final Fig 3 = a single-bar UNWEIGHTED twin of
+  Fig 2, both at 5 decimals.** The grouped-bar idea went through vertical → then
+  horizontal (label-collision fix: "unweighted" meant both the fitting row and the
+  eval bar) → and was ultimately **discarded**. User's final directive: "make a
+  plot highly similar to figure 2 but represents **unweighted test-split − unweighted
+  population**," and bump **both** Fig 2 and Fig 3 value labels to **5 decimal
+  places**.
+- **`fig3-cmp` is now a near-verbatim copy of Fig 2's `543d79e8`** — same 2×3
+  format (rows = fitting variant, top GREY "Unweighted model" / bottom ACCENT
+  "Survey-weighted model"; columns = models; one `barh` per metric, inverted y,
+  dotted zero line, shared symmetric x). The ONLY substantive change: `test_df`
+  filters `metrics_df["weighting"] == "unweighted"` (Fig 2 uses `"weighted"`), var
+  `gen_u_df`, x-label "**Unweighted** test-split score − unweighted population
+  score …", suptitle "**Unweighted** test estimate vs. population performance …".
+  No grouped bars, no `Patch` legend, no `MaxNLocator`/supylabel — all the
+  intermediate grouped-bar machinery is gone.
+- **5-decimal labels (both cells):** value-label fmt `%+.3f`→`%+.5f`, fontsize
+  8→7.5; to fit the wider labels the x-margin grew `×1.45`→`×1.8` and the text
+  offset went from a hardcoded `0.0007` to proportional `off = xmax*0.02`.
+- **Data:** `gen_df` (Fig 2, weighted) and `gen_u_df` (Fig 3, unweighted) are 30
+  rows each (3 models × 2 variants × 5 metrics). **The two figures side by side
+  are the intended read:** Fig 2 weighted gaps ~±0.001–0.004 (all near 0), Fig 3
+  unweighted gaps far larger — recall +0.021–0.032, accuracy −0.010 to −0.017 —
+  i.e. weighting the test evaluation removes most of the test↔population bias.
+- **Re-verified headless** (Agg) against the real store — both render; eyeballed
+  PNGs (5-decimal labels fit with no overflow, incl. the left-side negative
+  accuracy labels). Not opened in Jupyter.
+
+### 2026-08-30 — `create_figures.ipynb`: Fig 2 → 2×3 in Fig 1's exact format, split by fitting variant
+- **User directive (final of two same-session passes):** compare **weighted
+  test-set metrics to unweighted full-population metrics** (`gap = weighted test
+  − unweighted population`) — the fixed quantity — "using both weighted and
+  unweighted models," in a **format similar to Figure 1**. Purpose: does the
+  weighted test-set estimate match what would happen in the population?
+- **Two attempts this pass; the second is what shipped.** First reshaped 1×3 →
+  2×3 with **rows = test-metric evaluation weighting** (unweighted-eval top,
+  weighted-eval bottom) and grouped grey/accent bars per panel — misread
+  "unweighted/weighted models" as the evaluation weighting. User clarified the
+  gap is fixed (weighted test − unweighted population) and the split is by
+  **model** (fitting variant). **Final cell `543d79e8` is 2×3 in Fig 1's exact
+  format:** columns = models, **top row = unweighted (standard) model, all GREY;
+  bottom row = survey-weighted model, all ACCENT**, one single-color horizontal
+  bar per metric (no grouped bars, no per-panel legend). `test_df` filtered back
+  to `weighting == "weighted"`; `gen_df` = pop/test merge, `gap = test −
+  population`; row loop over `row_variants = [("standard","Unweighted\\nmodel",
+  GREY), ("survey_weighted","Survey-weighted\\nmodel", ACCENT)]` with rotated
+  left-column annotate labels. X-label "Weighted test-split score − unweighted
+  population score (nearer 0 = better estimate)" on bottom-row middle; suptitle
+  "Weighted test estimate vs. population performance (mean over {N_ITER}
+  iterations)". Symmetric shared x-axis `±|gap|.max()×1.45` (≈±0.005) so the
+  tiny gaps are legible.
+- **Finding:** all gaps ~+0.000 to +0.004 → the weighted test set is a
+  near-unbiased estimate of population performance for both model types. Largest
+  is NN standard recall (+0.004); a few survey-weighted precision/f1/recall gaps
+  go slightly negative (XGB). ROC-AUC is the one the survey-weighted model
+  estimates *high* (+0.001–0.002).
+- **Note:** this is the same gap the 2026-08-30 1×3 entry (below) plotted, now
+  just laid out as two single-color rows (fitting variant) instead of one panel
+  with grouped bars — a pure presentation change to match Fig 1.
+- **Durability:** single atomic `json.dump` write, `._*` swept first, `sync` +
+  re-read confirmed the 13-cell state stuck and the cell is 2-row / weighted-
+  filtered / `row_variants`-based (no `row_weightings` leftover). **Verified
+  headless** (Agg): setup + Fig 1 + Fig 2 execute against the real APFS store +
+  20-iteration parquets; `gen_df` = 30 rows (3 models × 2 variants × 5 metrics),
+  standard-row gaps +0.000–+0.004, survey-weighted-row gaps −0.000–+0.002.
+  Rendered to PNG and eyeballed (2×3, grey top / blue bottom, single bars, row
+  labels, no clipping). Not opened in Jupyter.
+
+### 2026-08-30 — `create_figures.ipynb`: Fig 2 = weighted-test vs unweighted-population only (2×3 → 1×3)
+- **User directive (with the target quantities spelled out):** Fig 2 should
+  compare **weighted metrics on the test split** to **unweighted metrics on the
+  population** (`gap = weighted test − unweighted population`), for **both**
+  fitting regimes (unweighted/standard and survey-weighted models). Purpose:
+  does the survey-weighted test-set estimate match what happens in the
+  population? User confirmed unweighted-only population metrics are fine so long
+  as the test-set metrics are weighted.
+- **Dropped the top (unweighted-evaluation) row.** The 2026-08-28 version was a
+  2×3 grid: top row `unweighted test − unweighted population`, bottom row
+  `weighted test − unweighted population`, grouped grey/accent per fitting
+  variant. The top row is not what's wanted, and (per that entry's own caveat)
+  its ~0.03 recall gap dominated the shared x-axis and squashed the weighted
+  row. Cell `543d79e8` is now **1×3** (one panel per model), keeping only the
+  weighted-test−unweighted-population gap.
+- **`test_df` now filtered to `weighting == "weighted"`** (was carrying both
+  weightings for the two rows); `gen_df` merge + `gap` unchanged in form.
+  Grouped bars per panel: grey = unweighted (standard) model, accent =
+  survey-weighted model — legend relabeled from "Standard/Survey-weighted
+  fitting" to "Unweighted (standard) model" / "Survey-weighted model". X-label →
+  "Weighted test-split score − unweighted population score  (nearer 0 = better
+  estimate)"; suptitle → "Weighted test estimate vs. population performance
+  (mean over {N_ITER} iterations)". Row labels/annotate and `row_weightings`
+  removed.
+- **Finding:** all gaps are tiny (~+0.000 to +0.004), so the weighted test set
+  is a near-unbiased estimate of population performance for both model types;
+  the largest single gap is NN standard recall (+0.004). A few weighted-model
+  precision/f1/recall gaps go slightly negative (XGB survey-weighted). The axis
+  is now scaled to this data alone (`±|gap|.max()×1.45`), so the bars are
+  actually legible instead of being dwarfed by the removed unweighted row.
+- **Durability:** single atomic `json.dump` write, `._*` swept first, `sync` +
+  re-read confirmed the 13-cell state stuck and the cell is 1-row / weighted-
+  filtered with no `row_weightings` leftover. **Verified headless** (Agg): setup
+  + Fig 1 + Fig 2 execute against the real APFS store + 20-iteration parquets;
+  `gen_df` = 30 rows (3 models × 2 variants × 5 metrics), rendered to PNG and
+  eyeballed (1×3, grey/blue grouped bars, no clipping). Not opened in Jupyter.
+
+### 2026-08-28 — `create_figures.ipynb`: renumber headers 1→5; add weighted-eval row to Fig 2
+- **User directive:** enumerate the figures top-to-bottom, and add a row to the
+  second figure visualizing the weighted metrics.
+- **Renumbered the markdown headers by position** so they read 1→5 down the
+  notebook: `e50a1951` "## Figure 4"→"## Figure 2", `82535ad9` "## Figure 2"→
+  "## Figure 3", `f0872be1` "## Figure 3"→"## Figure 4". `c02d4543` (Figure 1)
+  and `md-fig6` (Figure 5) already matched. Cell **order** is unchanged (Fig 1
+  live, Fig 2 = gen-gap live, Figs 3/4/5 still the commented ones); only the
+  header text moved.
+- **Fig 2 (gen-gap, cell `543d79e8`) reshaped 1×3 → 2×3.** Was one row of
+  grouped grey/accent bars per model on the *unweighted* test−population gap.
+  Now a 2-row grid mirroring Fig 1's layout: **top row = unweighted evaluation,
+  bottom row = survey-weighted evaluation**, each still grouped grey (standard
+  fitting) / accent (survey-weighted fitting) per metric. `test_df` now keeps
+  the `weighting` column (was filtered to `unweighted`); `gen_df` merges on
+  `[model, variant, metric]` so the single unweighted `pop_df` broadcasts across
+  both weightings, and `gap = test − population` is computed per weighting.
+  Added rotated left-column row labels ("Unweighted\nevaluation" /
+  "Survey-weighted\nevaluation") like Fig 1; x-label moved to the bottom-row
+  middle panel; shared symmetric x-axis over all gaps; suptitle unchanged.
+- **Data caveat (flagged to user):** weighted **population** metrics aren't
+  persisted per-row (population runs log `population_unweighted_*` only), so the
+  bottom row is `weighted test − unweighted population` — a mixed-regime
+  subtraction, not a like-for-like weighted gap. Consequence: the weighted-row
+  gaps are ~0 (±0.002) and barely visible on the shared axis dominated by the
+  unweighted recall gap (~0.03). If a true weighted gap is wanted, the drivers
+  must log weighted population metrics and re-run; if only legibility is wanted,
+  drop `sharex`. Left shared to match Fig 1.
+- **Durability:** single atomic `json.dump` write, `._*` swept first, `sync` +
+  re-read confirmed the 13-cell state + renumbered headers stuck. **Verified
+  headless** (Agg): all code cells execute against the real APFS store +
+  20-iteration parquets; Fig 2 renders 6 panels, and `gen_df` confirms the two
+  weighting rows carry distinct gaps. Rendered to PNG and eyeballed (2×3 grid,
+  grey/blue grouped bars, row labels, no clipping). Not opened in Jupyter.
+
+### 2026-08-28 — `create_figures.ipynb`: promote Fig 4 to second, comment the rest
+- **User directive:** move Figure 4 to right after Figure 1, and comment out the
+  other figures after the first two.
+- **New cell order:** intro, setup, `## Figure 1` (+`fig2` code), `## Figure 4`
+  (+`543d79e8` code, moved up), then the commented remainder — `## Figure 2`
+  (`load-labeled` + `fig3`), `## Figure 3` (`fig4`), `## Figure 5` (`3a1dc1f8`).
+  Markdown headers keep their original "Figure N" labels (not renumbered); only
+  the code cells for Figs 2/3/5 were commented. 13 cells, unchanged count.
+- **Commenting:** every source line of the four code cells (`load-labeled`,
+  `fig3`, `fig4`, `3a1dc1f8`) prefixed with `# ` so they're inert no-ops.
+- **Dependency note:** Fig 4's cell reuses `metric_order` / `metric_labels`
+  (defined in Fig 1's `fig2` cell) plus `metrics_df` / `client` / `MODELS` from
+  setup — so it runs standalone right after Fig 1. Commenting Fig 2's
+  `load-labeled` (which built `labeled`/`rate_df`) is safe because Figs 3 and 5,
+  its only consumers, are commented too.
+- **Durability:** single atomic `json.dump` write, `._*` swept first, `sync` +
+  re-read confirmed the 13-cell order stuck. **Verified headless** (Agg): setup,
+  Fig 1, and Fig 4 execute against the real APFS store + 20-iteration parquets
+  and render; the four commented cells run as no-ops. Not opened in Jupyter.
+
+### 2026-08-25 — `create_figures.ipynb`: Fig 1 caption + title clarity
+- **User directive:** in Fig 1's x-caption swap "non-survey-weighted" → "unweighted",
+  then asked for clarity suggestions.
+- **Caption:** `r"$\Delta$ score (survey-weighted − non-survey-weighted)"` →
+  `r"$\Delta$ score (survey-weighted − unweighted)"`.
+- **Title:** replaced the ambiguous `f"Standard Metric Differences, Test Split
+  (mean over {N_ITER} iterations)"` (the "Standard" read like the standard
+  fitting variant) with `f"Survey-weighted vs. unweighted fitting: metric
+  differences (test split, mean over {N_ITER} iterations)"`. Renders within the
+  figure width (verified headless).
+- **Row labels disambiguated** (applied on a follow-up ask): "Unweighted\nmetrics"
+  / "Survey-weighted\nmetrics" → "Unweighted\nevaluation" /
+  "Survey-weighted\nevaluation", so the rows (metric aggregation) no longer
+  collide with the caption's fitting-regime "unweighted". Verified headless.
+- **Offered but NOT applied** (from the same 4-option menu): (a) a "> 0 =
+  survey-weighted higher" direction hint on the caption; (b) muting near-zero
+  bars so color marks the movers instead of just re-encoding the row.
+
+### 2026-08-25 — `create_figures.ipynb`: delete Fig 5, reshape Fig 4 to Fig 1's 2-row layout
+- **User directive:** delete Figure 5 and make Figure 4 use the same layout as
+  Figure 1.
+- **Deleted Fig 5** (the 2026-08-25 Δ-generalization-gap chart, `## Figure 5`
+  markdown `md-fig5-gapdelta` + code `fig5-gapdelta`). The old Fig 6 (proba
+  distributions, `md-fig6`) renumbers to **`## Figure 5`**. **Notebook is back to
+  5 figures:** 1 test-split deltas, 2 predicted vs actual rate, 3 confusion,
+  4 test→population gap, 5 proba distributions.
+- **Fig 4 reshaped to Fig 1's grid.** Was a 1×3 grouped-bar chart (standard grey
+  / survey-weighted accent side-by-side per metric) with a figure-level legend.
+  Now a **2×3 grid** exactly like Fig 1: columns = models, top row = standard
+  fitting (all GREY), bottom row = survey-weighted fitting (all ACCENT), one
+  single-color horizontal bar per metric. Rotated left-column row labels
+  ("Standard fitting" / "Survey-weighted fitting") replace the legend (dropped
+  the `Patch` import + `fig.legend`); model titles on the top row; shared
+  symmetric x-axis (`±|gap|.max()×1.45`), dotted zero line, `+.3f` value labels,
+  left spine off, inverted y, left-aligned suptitle at y=0.995 — all copied from
+  Fig 1. `gen_df` construction (pop/test merge → `gap = test − population`) is
+  unchanged and now used only by this cell.
+- **Follow-up (same session): Fig 4 x-caption restyled to Fig 1's terse form.**
+  User asked for the row title + "Δ score" caption from Fig 1. Flagged that Fig
+  1's exact text ("Unweighted/Survey-weighted metrics" rows, "Δ score
+  (survey-weighted − non-survey-weighted)") would misdescribe Fig 4 (rows =
+  fitting variant, bars = test−population gap). User picked a truthful Δ-style
+  caption instead: x-label changed from "Test-split score − population score
+  (nearer 0 = generalized better)" → `r"$\Delta$ score (test split −
+  population)"`. Row titles ("Standard fitting" / "Survey-weighted fitting")
+  left as-is (already match Fig 1's placement/style). Re-rendered headless, no
+  clipping.
+- **Durability:** single atomic `json.dump` write, `._*` swept first, `sync` +
+  re-read confirmed the 13-cell state stuck (5 sequential `## Figure` headers).
+  **Verified headless** (Agg): all code cells execute against the real APFS
+  store + 20-iteration parquets; rendered Fig 4 to PNG and eyeballed — 2×3 grid,
+  grey/blue rows, no clipping, house style intact. Not opened in Jupyter.
+
+### 2026-08-21 — all three drivers: rename the `--n-iter` / `--iterations` CLI flags too
+- **User directive:** follow the constant rename (entry below) by renaming the
+  CLI flags as well.
+- **`--n-iter` → `--search-trials`** (argparse dest `search_trials`) and
+  **`--iterations` → `--train-test-cycles`** (dest `train_test_cycles`) in all
+  three drivers. Cascaded every reference: the `args.n_iter` / `args.iterations`
+  body accessors (the `range(...)` loops + tqdm search loop), the top-of-file
+  usage docstrings, and the mlflow logged param key **`"n_iter"` →
+  `"search_trials"`** (renamed for consistency; the notebook reads metrics not
+  params, so no figure breaks — but past runs in the store still carry the old
+  `n_iter` key).
+- **README updated** to the new flags (`## Train + evaluate` command block +
+  the flags bullet list); also fixed a pre-existing typo there —
+  `neural_network.py -- iterations 20` (stray space) is now
+  `--train-test-cycles 20`.
+- **This is a breaking CLI change** (superseding the "kept CLI stable" note in
+  the entry below): any saved command using `--n-iter` / `--iterations` must
+  switch to `--search-trials` / `--train-test-cycles`.
+- **Verified:** `grep` shows zero stale `--n-iter` / `--iterations` /
+  `args.n_iter` / `args.iterations` / `"n_iter"` refs; `py_compile` clean on all
+  three; `neural_network.py --help` lists both new flags. Not run end-to-end.
+
+### 2026-08-21 — all three drivers: rename the confusable `N_ITER` / `ITERATIONS` constants
+- **User directive:** make the difference between `N_ITER` and `ITERATIONS`
+  clearer by renaming, in all three drivers.
+- **`N_ITER` → `SEARCH_TRIALS`** (random-search trials per variant, the `--n-iter`
+  default: 20 for LR/XGB, 15 for NN) and **`ITERATIONS` → `TRAIN_TEST_CYCLES`**
+  (train/test cycles, the `--iterations` default: 5). Same values, just the
+  module-level constant names + their two argparse `default=` references in each
+  of `logistic_regression.py`, `xgb.py`, `neural_network.py`.
+- **Scope kept minimal / non-breaking.** The CLI flags (`--n-iter`,
+  `--iterations`), the `args.n_iter` / `args.iterations` accessors, and the
+  mlflow `"n_iter"` param name are **unchanged**, so README commands, the run
+  names, and `create_figures.ipynb` are unaffected. Also dropped the now-redundant
+  inline comments on the LR constants (`# random-search trials per variant` /
+  `# train/test cycles`) since the new names are self-documenting and the other
+  two files never had them — all three now consistent.
+- **Verified:** `grep` shows no stale `N_ITER` / `ITERATIONS` refs; `py_compile`
+  clean on all three. Not run end-to-end (pure rename).
+
+### 2026-08-25 — `create_figures.ipynb`: new Fig 5 (weighting's effect on generalization)
+- **Trigger:** coworker feedback on the sent figures — they wanted "the first
+  graph applied to the third graph": Fig 1's *difference* presentation
+  (survey_weighted − standard) applied to Fig 4's *quantity* (test − population
+  gap). i.e. does fitting with survey weights change how well the model
+  generalizes to the population? The raw comparison already existed as Fig 4's
+  grouped grey/accent bars; this makes the weighting *effect* explicit as one
+  bar per metric.
+- **New Fig 5 inserted right under Fig 4** (the generalization-gap cell), so the
+  old proba-distributions figure renumbers `## Figure 5` → `## Figure 6`.
+  **Notebook is now 6 figures:** 1 test-split deltas, 2 predicted vs actual
+  rate, 3 confusion, 4 test→population gap, **5 Δ-generalization-gap**, 6 proba
+  distributions.
+- **What it shows.** Reuses `gen_df` built in the Fig 4 cell (so it must stay
+  ordered after it): `gap_wide = gen_df.pivot(... columns=variant, values=gap)`,
+  `delta = survey_weighted_gap − standard_gap`. 1×3 panels (per model), one
+  horizontal ACCENT bar per metric, symmetric zoomed x-axis (`±|delta|.max()×1.45`
+  — deltas are ~±0.005), dotted zero line, per-model titles, top-left suptitle,
+  value labels. X-label spells the sign: "Survey-weighted − standard
+  generalization gap (< 0 = weighting generalized better)". No color legend —
+  single series, x-label carries it.
+- **Finding (reinforces the 2026-08-11 Fig 4 note):** weighting barely moves
+  generalization. Deltas are ~±0.005 across all three models; the only
+  consistent pattern is survey-weighted trades a hair of accuracy/precision for
+  a hair of recall (e.g. XGB accuracy −0.004, recall +0.005). ROC-AUC delta
+  ≈ 0 everywhere. So the honest read for the coworker is "no material
+  generalization benefit at this feature budget."
+- **Same-axis caveat to flag if asked:** the gap uses `population_unweighted_*`
+  only (weighted population metrics aren't persisted per-row), so this compares
+  *fitting* regimes, not weighted-vs-unweighted *evaluation*.
+- **Durability:** single atomic `json.dump` write (not sequential
+  `NotebookEdit`, per the ExFAT-clobber lesson), `._*` sidecar swept first,
+  then `sync` + re-read confirmed the 15-cell state stuck. **Verified headless**
+  (Agg): all 8 code cells execute against the real APFS store + 20-iteration
+  labeled parquets; rendered Fig 5 to PNG and eyeballed (no clipping, house
+  style intact). Not opened in Jupyter.
+
+### 2026-08-21 — `create_figures.ipynb`: drop calibration (Fig 5) + threshold sweep (Fig 7)
+- **User directive:** get rid of Figure 5 and Figure 7.
+- Removed the calibration/reliability cell (`## Figure 5` + `fig5-calib`) and
+  the precision/recall-vs-threshold cell (`## Figure 7` + `fig7-thresh`).
+  Renumbered the surviving predicted-probability-distributions figure from
+  `## Figure 6` to `## Figure 5`. **Notebook is back to 5 figures:** 1 test-split
+  deltas, 2 predicted vs actual rate, 3 confusion, 4 test→population gap, 5
+  proba distributions by true class.
+- **Single atomic write** again (drop cells by id via one `json.dump`), then
+  `sync` + re-read to confirm the 13-cell state stuck — same durability
+  discipline as the entry below. **Verified headless** (Agg): all 7 code cells
+  execute against the real store. Not opened in Jupyter.
+
+### 2026-08-21 — `create_figures.ipynb`: strip AI-looking comments; recover two lost figures
+- **User directive:** remove the comments that look AI.
+- **Discovered a durability failure first.** After the previous entry's
+  incremental `NotebookEdit` inserts, the on-disk notebook had regressed from
+  17 cells back to 13 — the calibration (Fig 5) and threshold-sweep (Fig 7)
+  cells + their `## Figure` headers never persisted, and the surviving
+  proba-distributions figure was left mislabeled `## Figure 5`. A stale
+  `._create_figures.ipynb` AppleDouble sidecar was present (the recurring
+  ExFAT quirk 1). The headless render in the prior turn read the complete
+  17-cell version from cache, so the "verified" claim there was real at the
+  time but did not survive to disk. **Lesson: on this ExFAT drive, a run of
+  sequential `NotebookEdit` writes can be partially clobbered — prefer a
+  single atomic write (one `json.dump`) for multi-cell notebook changes, and
+  re-read after `sync` to confirm the cell count stuck.**
+- **Rebuilt the whole notebook in one atomic Python write** (load JSON,
+  replace `source` on the edited code cells, splice the two restored figures
+  with correct `## Figure 5/6/7` headers, `json.dump` once). Restored: Fig 5
+  calibration, Fig 6 proba distributions (the survivor, renumbered from 5),
+  Fig 7 threshold sweep. Notebook is back to **7 figures**.
+- **De-AI comment pass.** Stripped the multi-line explanatory block comments I
+  had authored across the setup / Fig 1 / load-labeled / Fig 4-gap / Fig 5–7
+  cells (the "why"/rationale prose that belongs in this changelog, not inline).
+  Left exactly one inline comment — the user's own terse
+  `# Pulls each test iterations and averages out test set metrics` in setup.
+  No code behavior changed; only comments and (for the two restored cells)
+  re-materialization.
+- **Verified headless** (Agg) after a `sync` + re-read: notebook stably reads
+  as 17 cells, all 9 code cells execute against the real APFS store +
+  20-iteration labeled parquets, and only the one user comment remains. **Not**
+  opened in Jupyter.
+
+### 2026-08-21 — `create_figures.ipynb`: drop old Fig 5, add three proba-based figures
+- **User directive:** get rid of Figure 5 (population ROC-AUC bars) and brainstorm
+  other ideas. Brainstormed six; user picked calibration + proba distributions +
+  threshold sweep ("options 3–5"). None of the four surviving figures used the
+  `predicted_proba_{variant}` columns in the labeled parquets — these three all do.
+- **Deleted old Fig 5** (the 2026-08-11 population ROC-AUC grouped-bar chart, `## Figure
+  5` markdown + code). Notebook is now **7 figures**: 1 test-split deltas, 2 predicted
+  vs actual rate, 3 confusion, 4 test→population gap, and the three new ones below.
+- **New Fig 5 — calibration / reliability diagrams + ECE.** 1×3 panels,
+  `calibration_curve(n_bins=10, strategy="quantile")` per variant on the pooled test
+  rows, standard GREY / survey-weighted ACCENT, light-grey (`#b0b0b0`) dashed y=x,
+  `set_box_aspect(1)`, fixed 0–1 axes. Local `ece()` helper (10 uniform bins,
+  count-weighted) direct-labels each variant's ECE in the legend. Same construction as
+  the 2026-08-11 calibration entry (added/removed before) — reproduces the finding:
+  LR standard badly miscalibrated (ECE 0.330), survey weighting fixes it (0.074); XGB
+  slightly worse survey-weighted (0.156→0.189); NN near-perfect either way (~0.003).
+- **New Fig 6 — predicted-probability distributions by true class.** 1×3 step
+  histograms of the proba scores, `density=True` per group (so the ~12% positive mass
+  stays visible), color = variant (grey/blue), **solid = actual positives, dashed =
+  actual negatives**, dotted vertical at `TRUE_POSITIVE_RATE`. Mechanistic explanation
+  of Fig 2's positive-rate gap: LR standard scores pile up ~0.5, survey weighting pulls
+  the mass toward the base rate; NN scores cluster tightly near the base rate. Note the
+  class encoding is by linestyle (not color) specifically to keep grey/blue = variant
+  consistent with the rest of the notebook.
+- **New Fig 7 — precision & recall vs decision threshold.** 1×3, `precision_recall_curve`
+  per variant (drop the trailing point so `prec[:-1]`/`rec[:-1]` align with `thr`),
+  precision solid / recall dashed, color = variant, dotted vertical at 0.5. Shows 0.5
+  isn't special and where the P/R crossover sits per model. Precision goes noisy near
+  the high-threshold tail (few positives) — expected; NN curves end ~0.4 since its max
+  score is there.
+- **House style preserved:** GREY = standard, ACCENT = survey-weighted, terse suptitles,
+  figure-level `fig.legend` below with `Patch`/`Line2D` proxies, per-cell imports.
+- **Verified headless** (Agg): all 9 code cells run against the real APFS store +
+  20-iteration labeled parquets; rendered Fig 5/6/7 to PNG and eyeballed (calibration
+  ECEs match the known finding, distributions legible with class + variant readable,
+  threshold crossovers clear). **Not** opened in Jupyter — run all cells there to
+  confirm inline layout.
+
+### 2026-08-11 — `create_figures.ipynb`: Fig 1 solid row colors; new Fig 5 (population ROC-AUC bars)
+- **User directive:** Fig 1 — make the unweighted row fully grey and the
+  survey-weighted row fully blue; and add a Fig 5 vertical bar chart comparing
+  how well survey-weighted vs unweighted (standard) models generalize.
+- **Fig 1 color rule simplified.** Was: top row all GREY, bottom row
+  `ACCENT if |Δ| > 0.005 else GREY`. Now `colors = [GREY if r == 0 else ACCENT]
+  * len(...)` — the survey-weighted (bottom) row is uniformly ACCENT regardless
+  of Δ magnitude. Reverses the 2026-07-10 "grey the small survey-weighted
+  deltas" tweak, per this directive.
+- **New Fig 5 — population ROC-AUC grouped bars.** Markdown `## Figure 5` + code
+  after Fig 4. Queries the `{variant}_iter{N}_population` runs for
+  `population_unweighted_roc_auc`, grouped vertical bars per model (standard
+  GREY vs survey-weighted ACCENT), error bars = std over the 20 iterations
+  (tiny, ~0.0003–0.0017), value labels, **zoomed y-axis 0.60–0.672** (chance is
+  0.5; all models cluster near 0.66). Standard generalizes slightly better than
+  survey-weighted on all three (LR 0.660 vs 0.653, XGB 0.659 vs 0.656, NN 0.659
+  vs 0.657) — same direction as Fig 4's gap view. **Caveat:** truncated bar
+  baseline (0.60, not 0) to make the ~0.006 differences legible; the bar
+  heights are not proportional to absolute AUC. Switch to a dot/point plot if
+  that truncation is a problem for the paper.
+- **Notebook is 5 figures again** (Fig 6/7 stay deleted): 1 test-split deltas,
+  2 predicted-vs-actual rate, 3 confusion, 4 test→population gap, 5 population
+  ROC-AUC bars.
+- **Verified headless** (Agg): all 7 code cells run; rendered Fig 1 + Fig 5 to
+  PNG and eyeballed (solid grey/blue rows; grouped bars with visible error caps
+  and labels). Not opened in Jupyter.
+
+### 2026-08-11 — `create_figures.ipynb`: label Fig 1 as test-split; drop Figs 5–7
+- **User directive:** Fig 1 is test metrics — label it; and remove Figs 5–7.
+- **Fig 1 title** now `"Survey-Weighted − Standard Metric Differences, Test
+  Split (mean over {N_ITER} iterations)"`. Confirmed it is test-only: the setup
+  cell builds `metrics_df` solely from `test_*` keys on `{variant}_iter{N}_test`
+  runs, so both rows (unweighted / survey-weighted) are the 50k test split. Also
+  reworded the row-weightings comment to say so.
+- **Deleted Figs 5–7** (6 cells: the `## Figure 5/6/7` markdowns + their code) —
+  per-iteration ROC-AUC strip, PR curves, and the just-added calibration
+  reliability diagram. **Kept Fig 4** (population generalization). Git history
+  has the removed cells if any are wanted back; the calibration `ece()` helper
+  and the `precision_recall_curve` usage live in the 2026-08-11 entries below.
+- **Notebook is back to 4 figures:** 1 = test-split metric deltas, 2 = predicted
+  vs actual disability rate, 3 = confusion matrices, 4 = test→population
+  generalization gap. `load-labeled` (builds `labeled`/`rate_df`) is still used
+  by Figs 2–3, so it stays.
+- **Verified headless** (Agg): all 5 remaining code cells run end-to-end against
+  the real store. Not opened in Jupyter.
+
+### 2026-08-11 — `create_figures.ipynb`: re-add calibration as Fig 7
+- **User directive:** add the calibration figure too. **Note this reverses the
+  2026-08-07 "calibration removed" directive** — the `predicted_proba_*`
+  columns were kept in the labeled parquets, so nothing had to be re-run.
+- **Fig 7 — reliability diagrams.** New `## Figure 7` markdown + code cell after
+  the PR curves. 1×3 panels (per model), `calibration_curve(..., n_bins=10,
+  strategy="quantile")` per variant on the pooled test rows, standard GREY /
+  survey-weighted ACCENT, light-grey (`#b0b0b0`) dashed y=x reference (distinct
+  from standard's GREY), `set_box_aspect(1)` square panels, fixed 0–1 axes for
+  cross-model comparability. A local `ece()` helper (10 uniform bins,
+  count-weighted) direct-labels each variant's ECE in the panel legend.
+- **Finding (worth keeping):** the balanced class weighting makes all models
+  *over-forecast* disability (reliability curves below the diagonal). LR
+  standard is badly miscalibrated (ECE 0.330, mean proba 0.45 vs 12% base) and
+  survey weighting fixes it a lot (ECE 0.074); XGB is moderate both ways and
+  slightly *worse* survey-weighted (0.156 → 0.189, non-monotonic curve); NN is
+  near-perfectly calibrated either way (ECE ~0.003–0.004, mean proba ≈ base
+  rate). So the survey-weighting calibration effect is model-dependent, not a
+  uniform improvement.
+- **Verified headless** (Agg): all 9 code cells run; rendered Fig 7 to PNG and
+  eyeballed (square panels, ECE legends readable, NN hugs the diagonal near the
+  origin as expected). Not opened in Jupyter.
+
+### 2026-08-11 — `create_figures.ipynb`: add Fig 4 (population generalization) + Fig 5/6 drafts
+- **User directive:** add a figure for how well the survey-weighted vs
+  non-weighted models generalized to the population data, then draft a couple
+  more figures of interest.
+- **Fig 4 — generalization gap (test − population).** New markdown `## Figure 4`
+  + code cell after the confusion grid. Pulls the previously-unused
+  `{variant}_iter{N}_population` runs (`population_unweighted_{accuracy,f1,
+  precision,recall,roc_auc}`, 40 per model = 20 iters × 2 variants), averages
+  over iterations into `pop_df`, and subtracts from the unweighted test metrics
+  already in `metrics_df` (`gap = test − population`). 1×3 grid (per model),
+  5 metrics, grouped horizontal bars — standard GREY, survey-weighted ACCENT —
+  on a **zoomed symmetric x-axis** (`±|gap|.max()×1.45`) because raw gaps are
+  ~±0.03 and would be invisible on a 0–0.8 scale. Chose the gap over absolute
+  population bars for exactly that legibility reason (absolute levels are in
+  Fig 1's world). Finding: both regimes generalize about equally (ROC-AUC gap
+  ~0.004; recall drops most, ~0.02–0.03; accuracy is *higher* on the population,
+  negative gap, since the population base rate differs from the per-state
+  sample). Survey weighting does not visibly improve population generalization
+  at this feature budget.
+- **Fig 5 — per-iteration test ROC-AUC strip.** Uses the per-iteration `latest`
+  dict from the setup cell (no new query) → `iter_df`; jittered scatter of all
+  20 iterations per model/variant with a thick mean tick. Shows the
+  standard-over-survey-weighted ROC-AUC gap is real in the means but small
+  relative to iteration-to-iteration spread (clouds overlap heavily).
+- **Fig 6 — Precision–Recall curves.** `sklearn.metrics.precision_recall_curve`
+  on the pooled labeled test rows (1M/model) per variant, 1×3 panels, dotted
+  no-skill line at `TRUE_POSITIVE_RATE`. PR chosen over a 0.5-threshold view
+  given the ~12% positive rate. LR shows a clear standard-vs-survey-weighted
+  separation (survey-weighted precision dip at low recall); XGB nearly
+  coincident; NN identical.
+- **House style preserved:** GREY = standard/context, ACCENT (mako[2], renders
+  blue) = survey-weighted, terse suptitles, figure-level `fig.legend` below,
+  direct value labels. Fig-level `Patch`/`Line2D`/`precision_recall_curve`
+  imports are repeated in the new cells so each runs standalone.
+- **Verified end-to-end headless** (Agg): all 8 code cells execute against the
+  real APFS store + 20-iteration labeled parquets; rendered Fig 4/5/6 to PNG
+  and eyeballed layout (no label clipping, legends clear). **Not** opened in
+  Jupyter — run all cells there to confirm inline rendering.
+
+### 2026-08-11 — `create_figures.ipynb`: fix embedded-tag SyntaxError; de-AI the code
+- **Bug:** the notebook wouldn't run — the setup cell's last source line had a
+  stray `</cell id="setup">` literally appended
+  (`...f"{_counts[0]}–{_counts[-1]}"</cell id="setup">`), a bogus XML-ish tag
+  baked into the cell JSON. `compile` raised
+  `SyntaxError: invalid syntax` on that line. Only cell 1 was affected;
+  removed the tag. **Watch for this** — if a cell suddenly won't parse, dump
+  the raw JSON source (`json.load` → `''.join(cell['source'])`) and check for
+  a trailing `</cell ...>` artifact before assuming a logic error.
+- **De-AI pass (user directive "make it look less ai code wise"):** trimmed the
+  multi-line explanatory block comments that restated rationale across the
+  setup / Fig 1 / Fig 2 cells down to one-liners; renamed the misleading `best`
+  dict → `latest` (it keeps the latest run per iteration, not a "best");
+  collapsed `n_iter_by_model`/`_counts` bookkeeping to `n_iter`/`counts`; dropped
+  the unused `TEST_PARQUET` constant and the `raw_df` intermediate (inlined the
+  `pd.DataFrame(rows).groupby(...)`); folded the labeled-parquet load into one
+  comprehension. Behavior unchanged — same `metrics_df`, `rate_df`, `labeled`,
+  `N_ITER`. Fig 2/3 cells (`fig3`, `fig4`) left as-is (no comment tells).
+- **Verified end-to-end** (not just `py_compile`): ran all 5 code cells headless
+  with the `Agg` backend against the real APFS store + the 20-iteration labeled
+  parquets — every cell executes, `N_ITER="20"`, `metrics_df` = 60 rows
+  (3 models × 2 variants × 2 weightings × 5 metrics), all three figures render
+  with no error. **Not** visually inspected in Jupyter (standing "don't run
+  headless" preference is about layout) — open and run all cells to eyeball the
+  figures.
+
+### 2026-08-11 — NN topped up to 20 genuine iterations; `create_figures.ipynb` averages over iterations
+- **Context:** the NN had 15 iterations (iter0–14) plus a second `--iterations 5`
+  batch that logged under `{variant}_iter{0..4}_*` and reproduced iter0–4
+  **byte-identically** — the driver restarts the per-iteration seed at `SEED+0..4`
+  each invocation (`SEED + it`, `it` = loop index from 0), so a plain re-run
+  replays the same draws. Those batch-2 runs were briefly renamed iter15→19
+  (parquets copied) to fake "20 iterations", but that just duplicated iter0–4
+  with zero added variance. **Resolution: delete the fakes, add a temporary
+  continuation flag, run the real iter15–19, then remove the flag.**
+- **Deleted the 180 duplicate runs** (`_iter1[5-9]_*`) via `MlflowClient.delete_run`
+  and `rm`'d the copied `..._iter{15..19}.parquet`, returning NN to 15 genuine
+  iterations first.
+- **`neural_network.py`: added, used, then removed a `--start-iteration` flag.**
+  Temporarily changed the loop to
+  `range(args.start_iteration, args.start_iteration + args.iterations)` so `it`
+  (which drives the sample seed `SEED + it`, the split `random_state`, the run
+  names, and the parquet filename) could continue past 14. Ran it in two pieces:
+  a first `--start-iteration 15 --iterations 5` background job was **killed** at
+  ~3.5/5 iterations (iter15–17 complete, iter18 half-done — one population run
+  missing, iter19 not started); cleaned iter18's 35 partial runs + parquet and
+  finished with `--start-iteration 18 --iterations 2` (exit 0). Final NN state:
+  **20 distinct iterations (0–19), no duplicate names, iter15–19 on seeds 57–61
+  and genuinely independent** (e.g. iter18 test ROC-AUC 0.6645 ≠ iter3 0.6647).
+  Per user directive the flag was then **removed** — loop, argparse arg, and
+  docstring reverted to the original single-`range(args.iterations)` form
+  (`py_compile` clean, no `start-iteration` string remains). NB: the driver is
+  once again replay-on-rerun; if a future top-up is needed, re-add the one-liner
+  from this entry (git history has it). LR/XGB share the identical `SEED + it`
+  pattern and would need the same.
+- **`create_figures.ipynb` setup cell** rewritten for the iteration average:
+  - MLflow metric query dedups by `(model, variant, iteration)` — `TEST_RE`
+    gained an iteration capture group; a `best` dict keeps the latest run per
+    iteration. Defensive against a continuation run re-logging an existing
+    iteration name; a no-op now that indices are unique.
+  - `N_ITER` is a per-model-aware string (`n_iter_by_model` counts distinct
+    iterations, collapsing to one number when the models agree else a range) —
+    now **"20"** for all three, so the three suptitles read "over 20 iterations".
+    Dropped the unused `from collections import Counter`.
+- **Validated** in a standalone script against the real store: MLflow →
+  {LR:20, XGB:20, NN:20}, parquet globs → {20,20,20}, `N_ITER="20"`, iter18/19
+  independent of iter3/4. **Not** rendered in Jupyter (standing "don't run
+  headless" preference) — open and run all cells to eyeball layout.
+
+### 2026-08-07 — `create_figures.ipynb`: average metrics over iterations, drop calibration
+- **User directive:** make the metrics figures display the average over the
+  iterations that were run, and remove the calibration plot.
+- **Setup cell rewritten for the iteration architecture.** Was filtering
+  `attributes.run_name = '{variant}_test'` and taking the single best run by
+  `test_weighted_roc_auc`. Now regex-matches every `{variant}_iter{N}_test`
+  run (`^(standard|survey_weighted)_iter\d+_test$`), collects all `test_*`
+  metrics, and **means them per (model, variant, weighting, metric)** into
+  `metrics_df`. Added `N_ITER` (max test-run count per model/variant, = 20
+  here) for figure titles. Verified against the manual summary stats: the
+  averaged LR values match exactly (e.g. standard unweighted ROC-AUC 0.6644,
+  precision 0.2051; 40 test runs → 400 metric rows → mean over 20 iters).
+- **Robust to partial runs.** `MODELS` is now filtered to models whose MLflow
+  experiment exists (`get_experiment_by_name is not None`), so the notebook
+  runs with only LR present (XGB/NN never ran — no experiments, no labeled
+  parquets). Fig 1 grid and the confusion grid size to `len(MODEL_ORDER)` with
+  `squeeze=False`, so 1 model doesn't leave empty panels or break `axes[i,j]`
+  indexing (`subplots(1,2)` would otherwise return a 1-D array).
+- **Labeled-parquet loading repointed to per-iteration glob + concat.** Was
+  reading a single `data/test_labeled_<model>.parquet`; now globs
+  `data/test_labeled_<model>_iter*.parquet` and `pl.concat`s all 20 (→ 1M
+  pooled rows for LR). Confusion matrices (Fig 3) pool cleanly over that.
+- **Figure 2 lost its population-weighted panel (user-approved).** The new 50k
+  labeled parquets are 5-col (`TARGET` + proba/binary per variant) — **no
+  `State population` column**, and the rows are a shuffled subset that no
+  longer row-aligns to `data/test.parquet`, so the old `pred * state_pop`
+  population-weighted rate is unrecoverable without changing the drivers to
+  persist a weight column + re-running. Asked; user chose **drop the panel**.
+  Fig 2 is now a single-panel unweighted predicted-positive-rate vs actual,
+  pooled over iterations. (If both panels are wanted back, persist `State
+  population` into the labeled parquet in the drivers and re-run — then restore
+  the 1×2 layout.)
+- **Calibration removed.** Deleted the `## Figure 4` markdown cell and the
+  `calibration_curve` / ECE code cell entirely (per the drop request; this
+  also sheds the only dependency on the `predicted_proba_*` columns for a
+  figure, though those columns are still present in the parquets).
+- **Not rendered in Jupyter.** Per the standing "don't run this headless"
+  preference, only the data cells (MLflow query + averaging + parquet pooling)
+  were validated in a standalone script; open the notebook and run all cells
+  to eyeball layout (empty-panel sizing at 1 model, single-panel Fig 2,
+  pooled confusion percentages).
+
+### 2026-08-07 — README: de-AI voice pass, matched to `../data_pipeline/README.md`
+- **User directive:** make the README read less AI, then follow the sibling
+  `../data_pipeline/README.md` as a style guideline. No content change, just
+  voice.
+- Stripped the scattered `**bold**` emphasis and parenthetical hedges; fixed
+  "preperation" → "prep".
+- Restructured to the data_pipeline house style: title with the one-line
+  description on the very next line (no blank), short section headers, a
+  prose+code-fence-per-step rhythm, `<http://...>` angle-bracket URLs, and
+  `*(default N)*` italics. Replaced the flags **table** with a terse bullet
+  list. Moved the labeled-parquet / MLflow-run-names detail into a short
+  `## Output` section mirroring the guideline's. Same commands, flags, and
+  store instructions.
+
+### 2026-08-04 — all three drivers: 200k/50k split + population eval (new eval architecture)
+- **User directive (with a diagram):** stop training on the whole per-state
+  sample and evaluating on the rest of the file. Instead, out of the ~250k
+  5000-per-state sample, split **200k train / 50k test**; build model M on the
+  200k; record **weighted + unweighted** metrics on the 50k test split; then
+  record **unweighted** metrics on the **rest of the population** (every row not
+  in the sample). Goal is the bias contrast: weighted/unweighted test precision
+  vs. population precision.
+- **Sampling change.** The 5000-per-state draw is unchanged (~250k, one scan),
+  but the sample is now `train_test_split(test_size=TEST_SIZE=50_000,
+  stratify=y_all, random_state=SEED+it)` into `X`/`X_test` (200k/50k). The
+  training block (random search, refit, `train_*` weighted+unweighted metrics)
+  is otherwise untouched and now operates on the 200k. Renamed `train_idx`/
+  `train_mask`/`train_df` → `sample_idx`/`sample_mask`/`sample_df`; the mask now
+  covers the whole 250k sample so the population pass excludes both train and
+  test (no overlap with the 50k test metrics). `balanced_spw` (XGB) and `cw`
+  (NN) moved to after the split so they're computed on the 200k train `y`.
+- **Three eval surfaces per iteration** (was two):
+  - `{variant}_iter{N}_train` — unchanged (weighted + unweighted train metrics,
+    nested search trials).
+  - `{variant}_iter{N}_test` — the 50k split, now logs **both**
+    `test_unweighted_*` and `test_weighted_*` (was unweighted-only). In-memory,
+    no streaming.
+  - `{variant}_iter{N}_population` — NEW. Streams the file (50k `BATCH`), skips
+    `sample_mask` rows, logs `population_unweighted_*` only. This is the old
+    streaming loop repointed from `train_mask` to `sample_mask`.
+- **Labeled parquet is now the 50k test split** (was the full held-out set):
+  `data/<stem>_labeled_<model>_iter{N}.parquet`, same 5-col proba+binary schema,
+  50k rows. Population predictions are **not** persisted (only its metrics are
+  logged) — the 33M-row proba dump per iteration wasn't worth the disk. Ask if
+  a population-level calibration/confusion figure later needs those columns.
+- **Bias itself is not computed in the drivers** — it's a subtraction of logged
+  metrics (test weighted/unweighted precision − population precision), left for
+  `create_figures.ipynb`. That notebook is already stale (per earlier entries)
+  and now also needs the new run names + `population_*` / `test_weighted_*` keys.
+- **Cost:** still 2 full passes over the file per iteration (1 scan for the 250k
+  sample + 1 stream for the population); train is now 200k instead of 250k.
+- **Caveat:** `TEST_SIZE=50_000` is absolute — the per-state sample must exceed
+  50k (≥11 states at 5k/state), always true for the 50-state PUMS data but it
+  would error on a tiny pool.
+- **Verified end-to-end** on a 260k-row synthetic parquet (50 states × 5200,
+  real 529-col schema) at `--iterations 1 --n-iter 1–2` for all three drivers:
+  `_test` runs carry 10 metrics (unweighted+weighted ×5), `_population` runs
+  carry 5 (unweighted), labeled parquets are 50k×5. **Not** run on the real 33M
+  `data/test.parquet` yet — do a real cycle (keep the APFS `MLFLOW_TRACKING_URI`)
+  and watch population-stream wall time before trusting numbers.
+
+### 2026-08-04 — remove Docker; rewrite README for the host-venv flow
+- **User directive:** get rid of the Docker implementation and change the
+  README to spell out how to run each model with its params + how to boot
+  mlflow.
+- **Deleted `Dockerfile`.** `.dockerignore` was already gone; `requirements.txt`
+  is kept as the venv dependency list (no longer "used by the image"). Docker
+  had drifted out of use and the new APFS default store
+  (`~/mlruns_ml_pipeline`, see entry below) wouldn't exist inside a container
+  anyway. Restore from git history if containerization is ever wanted again.
+- **`README.md` rewritten** around `.venv/bin/python`: Setup (venv + `pip
+  install -r requirements.txt`), data processing, a per-model run block
+  (`logistic_regression.py` / `xgb.py` / `neural_network.py` each with
+  `--iterations 5` and their default `--n-iter` — 20 for LR/XGB, 15 for NN),
+  a flags table (`--iterations`, `--n-iter`, `--threshold`, positional
+  `input`), and an MLflow-UI section pointing `--backend-store-uri` at the
+  APFS store on port 5001.
+- **CLAUDE.md body de-Dockered:** status line, Layout, "Running it", the
+  "Docker is back" decision, and the Docker "Don't" rules all updated to the
+  host-venv reality. Historical changelog entries left verbatim per the rule.
+- No code changed; the three drivers already default to the APFS store.
+
+### 2026-08-04 — all three drivers: default MLflow store → APFS (fixes ExFAT `._*` crash)
+- **Trigger:** a plain `python3 logistic_regression.py --iterations 3
+  data/test.parquet` (no `MLFLOW_TRACKING_URI` exported) crashed with
+  `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb0` from
+  `file_store.py` `_get_all_tags` → `read_file`. Root cause is the recurring
+  AppleDouble quirk: the default store was `ml_pipline/mlruns/` on the ExFAT
+  drive, macOS keeps regenerating `._*` sidecars there, and MLflow's file
+  store reads each one as a tag file and chokes on the `0xb0` header byte.
+  27 `._*` files were present under `mlruns/`; deleting them is not durable
+  (recreated on the next write).
+- **Fix:** changed the `TRACKING_URI` fallback in `logistic_regression.py`,
+  `xgb.py`, `neural_network.py` from
+  `f"file://{Path(__file__).resolve().parent / 'mlruns'}"` to the APFS store
+  `"file:///Users/dpham/mlruns_ml_pipeline"` — the same escape hatch the
+  earlier changelog entries told callers to export by hand, now the default.
+  The `MLFLOW_TRACKING_URI` env override still wins, so nothing that already
+  sets it changes. New runs land alongside the existing July/August APFS runs
+  instead of the stranded ExFAT `mlruns/`.
+- **Docker caveat:** inside the container the old default resolved to the
+  bind-mounted `/app/mlruns`; the new absolute host path
+  `/Users/dpham/mlruns_ml_pipeline` does not exist in the container. If a
+  driver is ever run inside Docker, export `MLFLOW_TRACKING_URI` (e.g. to
+  `/app/mlruns`) or runs won't persist to a bind mount. Host runs are the
+  common path and are unaffected.
+- `Path` is still used elsewhere in each file (import stays live). `py_compile`
+  clean on all three; not re-run end-to-end.
+
+### 2026-08-04 — xgb.py + neural_network.py: cast feature matrix to Float32 (match LR)
+- **User directive:** apply the LR Float32 change to the other two drivers.
+  `X` (train) and `X_b` (test batch) now `.cast(pl.Float32).to_numpy()`.
+- **`xgb.py`:** was a bare `.to_numpy()` (Float64) — same ~1 GB → ~0.5 GB train
+  drop as LR. Bonus: XGBoost's `hist` uses Float32 internally, so passing
+  Float32 also avoids an internal up/down-conversion copy in `.fit()`.
+- **`neural_network.py`:** was `.to_numpy().astype(np.float32)` — the *result*
+  was already Float32, but it materialized a Float64 numpy array first, then
+  cast. Casting inside polars removes that transient Float64 peak. Matters most
+  here: the full matrix is moved to-device once (`X.to(device)`), so the
+  host-side Float64 spike was doubling the resident copy right before the MPS
+  transfer.
+- `py_compile` clean on both; not run end-to-end.
+
+### 2026-08-04 — logistic_regression.py: cast feature matrix to Float32
+- **User directive** after an OOM crash: halve the train-matrix footprint.
+  `X` (train) and `X_b` (test batch) now `.cast(pl.Float32).to_numpy()` instead
+  of a bare `.to_numpy()`, which was promoting the mixed UInt8/Float32 frame to
+  **Float64**. Cast happens *inside polars* so no transient Float64 numpy array
+  is ever materialized. Train matrix (250K × 526) drops ~1 GB → ~0.5 GB; each
+  50K test batch halves too. sklearn's LR upcasts internally for lbfgs, but the
+  script-held copy + `train_test_split` copies are now half-size — that was the
+  memory that got SIGKILL'd when a second pipeline ran concurrently.
+- **Context:** the crash was an OOM kill (no traceback in logs), not a
+  streaming failure — test set is still streamed via `pq.iter_batches`. Root
+  cause was two+ pipelines (a manual foreground run + a stale LR→XGB→NN
+  background run from an earlier session) hammering 18 GB RAM at once. Kill
+  stragglers and run one model at a time; keep the APFS `MLFLOW_TRACKING_URI`.
+- **Not applied to `xgb.py` / `neural_network.py`** — same one-liner would help
+  both (NN especially, since it holds the full matrix on-device), but only LR
+  was requested. `py_compile` clean; not run end-to-end.
+
+### 2026-08-04 — all three drivers: single-run train+test, per-state sampling, N iterations
+- **User directive:** stop using `data/train.parquet`. Each program run now does
+  training *and* evaluation itself (no more `--mode`). Per cycle: sample 5000
+  rows per state out of `data/test.parquet` for training, evaluate on all the
+  remaining rows. Training logs unweighted **and** weighted metrics; **test logs
+  unweighted only**. New `--iterations` arg repeats the whole cycle, each with a
+  fresh 5000-per-state sample.
+- **`--mode` removed** from `logistic_regression.py`, `xgb.py`,
+  `neural_network.py`. New `--iterations` flag (default 5). `--n-iter`
+  (random-search trials) and `--threshold` unchanged. The positional `input` is
+  now the *pool* to split (pass `data/test.parquet`), not a pre-split file.
+- **Per-state sampling.** State is one-hot across 50 `State (FIPS code)_*`
+  columns. Reconstruct an integer state id once up front via
+  `pl.sum_horizontal([col_i * i ...])` (projection pushdown reads only the 50
+  state cols), then `np.where` to build per-state row-index pools. Each
+  iteration draws `min(5000, n_state)` indices per state with a per-iteration
+  seed (`SEED + it`) → ~250K train rows. `PER_STATE = 5000` is a module
+  constant (not a flag; user fixed it at 5000).
+- **Train rows** loaded via `scan_parquet().with_row_index().filter(is_in(idx))`
+  (one full scan, materializes only the 250K sample). **Test** streams the file
+  in 50K-row pyarrow batches and drops sampled rows via a boolean
+  `train_mask[offset:offset+len]` slice, so train/test are exactly disjoint and
+  together cover the whole file. **Cost:** 2 full passes over the 6.7 GB file
+  per iteration (scan for train + stream for test) — I/O heavy at high
+  `--iterations`.
+- **MLflow runs are flat + iteration-suffixed** (per user choice):
+  `{variant}_iter{N}_train` (weighted+unweighted train metrics, `val_roc_auc`,
+  `best_threshold`, nested `{variant}_iter{N}_trial_{i}` search runs) and
+  `{variant}_iter{N}_test` (`test_unweighted_*` only). Run count per model per
+  run = `iterations × 2 × (1 + n_iter + 1)` — lots of `._*` sidecar spray on
+  ExFAT; keep the APFS `MLFLOW_TRACKING_URI` escape hatch.
+- **Model persistence dropped.** No more `mlflow.{sklearn,xgboost,pytorch}.log_model`
+  / `search_logged_models` / `load_model` — models stay in memory since test
+  runs in the same process. Those imports were removed.
+- **Labeled output is per-iteration:** `<stem>_labeled_<model>_iter{N}.parquet`
+  in `./data/`, same 5-column proba+binary schema. So a default 5-iteration run
+  of all three models writes 15 labeled parquets.
+- **Verified:** `py_compile` all three; a standalone check that the state-id
+  reconstruction is exact and the train/test split is disjoint + complete
+  (incl. the `n_state < 5000` cap); and an end-to-end `--iterations 2 --n-iter 2`
+  run of all three on a 36K-row synthetic parquet — train runs carry both
+  weighted+unweighted metrics, test runs carry unweighted-only, run names and
+  per-iteration labeled parquets landed as specified. **Not** run on the real
+  33M-row `data/test.parquet` yet — do a real cycle (keep exporting the APFS
+  `MLFLOW_TRACKING_URI`) before trusting numbers; watch wall time (2 full passes
+  × iterations) and NN cost (full random search × iterations).
+- **Follow-up — `create_figures.ipynb` is now stale against these runs.** It
+  filters `attributes.run_name = '{variant}_test'` and reads
+  `data/test_labeled_*.parquet`; the new run names are `{variant}_iter{N}_test`
+  and the labeled files are `..._iter{N}.parquet`. The notebook needs updating
+  (pick an iteration or aggregate across iterations) before regenerating figures.
+  Not done here — not requested.
+
+### 2026-07-29 — real train/test cycle confirmed done; July 10 work committed
+- **The July 10 driver rewrites were run on the real parquets** (not just the
+  synthetic smoke test the earlier entries warned about). Evidence on disk:
+  `data/test_labeled_{lr,xgb,nn}.parquet` dated Jul 10 13:23–13:33 carry the
+  5-column proba+binary schema, and the APFS store
+  (`file:///Users/dpham/mlruns_ml_pipeline`) holds all three experiments'
+  Jul 10 runs — nested trials (LR/XGB ×20, NN ×15), refit `_train` parents,
+  and `standard_test` / `survey_weighted_test`. **The "not run on real data"
+  caveats in the Jul 10 entries below are superseded** (kept verbatim per the
+  historical-entries rule).
+- **Committed the uncommitted Jul 10 work** to `main` (commit "Random-search
+  tuning, proba outputs, and calibration figure"): the 5 modified files
+  (README + `create_figures.ipynb` + the 3 drivers). Unpushed. `CLAUDE.md` is
+  gitignored, so these changelog entries are not part of the commit.
+- **Still open:** `create_figures.ipynb` has not been rendered in Jupyter
+  against the fresh runs + proba columns. Open it and run all cells (per the
+  standing "don't run this headless" preference) to visually verify Fig 4
+  calibration and the Fig 1 2×3 grid before using them in the paper.
+
+### 2026-07-10 — `create_figures.ipynb`: Fig 1 clarify Δ label + grey unweighted row
+- **User directive:** spell out what the Δ score is in the x-axis parenthesis,
+  and make the top (unweighted-metrics) row grey.
+- **X-axis label:** `$\Delta$ score (treatment - control)` →
+  `$\Delta$ score (survey-weighted − non-survey-weighted)`. Names the actual
+  contrast instead of the abstract treatment/control framing.
+- **Top row greyed.** The `r == 0` (unweighted) row now forces all bars to
+  `GREY` regardless of |Δ|; only the bottom (survey-weighted) row keeps the
+  `ACCENT if |Δ| > 0.005 else GREY` rule. Reinforces the design language —
+  the survey-weighted evaluation is the story, the unweighted row is context.
+- **Not visually verified.** Open in Jupyter, run the Fig 1 cell.
+
+### 2026-07-10 — all three drivers: log every random-search trial as a nested MLflow run
+- **User directive:** log the individual trials (previously only the winning
+  config was logged; losing trials were discarded in-memory).
+- **Shape:** the per-variant `{variant}_train` run is now the **parent** and
+  wraps the whole search + refit. Each trial opens a nested run
+  `{variant}_trial_{i}` (`nested=True`) logging that trial's sampled
+  hyperparameters (incl. the class-weighting hyperparameter — `class_weight`
+  for LR, `use_class_weight`/`scale_pos_weight` for XGB,
+  `use_class_weight`/`hidden`/`dropout`/`wd`/`lr` for NN) and its
+  `val_roc_auc`. The parent still logs the best config, `val_roc_auc`, the
+  full-data train metrics, and the model.
+- **Run count per model:** `2 × (1 + n_iter)` training runs (parent +
+  n_iter nested, per variant). At the NN default `n_iter=15` that's 32 runs
+  per model — the file-store on the ExFAT drive will spray a lot more `._*`
+  sidecars; keep using the APFS `MLFLOW_TRACKING_URI` escape hatch.
+- **Test-mode loading unaffected:** only the parent run logs a model (under
+  `name=variant`); nested trial runs log no model, so
+  `search_logged_models(filter_string="name='{variant}'")` still resolves to
+  the one refit model per variant.
+- **Verified end-to-end** (LR, `--n-iter 3`, synthetic parquet): 8 runs
+  landed = 2 parents + 6 nested; each trial carried its `val_roc_auc` and
+  the parent's value matched its best trial. XGB/NN share the identical
+  structure and `py_compile` clean.
+
+### 2026-07-10 — `neural_network.py`: drop SEARCH_EPOCHS, widen to depth-3 nets for 526 features
+- **User directive:** get rid of the separate `SEARCH_EPOCHS` (use `EPOCHS`
+  for both the search trials and the final refit), and resize the MLP for
+  the real 526-feature input — depth 3, wider.
+- **`SEARCH_EPOCHS` removed.** The random-search trial fits now train for the
+  same `EPOCHS = 15` as the final refit (the trial-loop `train_mlp(...)` call
+  now passes `EPOCHS`). One knob for both phases. **Cost note:** every trial
+  is now a full 15-epoch fit, so the NN search is ~2× the compute it was at
+  8 search-epochs — dial `--n-iter` down if that bites. LR/XGB were
+  unaffected (no epoch concept; XGB's `n_estimators` stays a searched param).
+- **Architecture widened to depth-3.** `HIDDEN_CHOICES` was
+  `[(64,32),(128,64),(128,64,32)]` (mixed depth 2/3, max width 128) → now
+  `[(256,128,64),(384,192,96),(512,256,128)]` — all three hidden layers,
+  tapering, first layer 256–512 to match the ~526-dim one-hot+scaled input
+  (confirmed: `data/test.parquet` = 529 cols − TARGET/TARGET_NEG/WEIGHT =
+  526 features). Width stays a searched hyperparameter; depth is now fixed
+  at 3.
+- **Verified** `py_compile` + an `--n-iter 2` train+test smoke run on the
+  600-row synthetic parquet (wide net on 6 synthetic features is
+  overparameterized but exercises the code path): no errors, 5-column
+  labeled output intact. **Not** run on the real 250K/33M parquets — the
+  wider nets + full-epoch search will be noticeably slower there; do a real
+  train+test cycle before trusting tuned numbers.
+
+### 2026-07-10 — `create_figures.ipynb`: add Fig 4 calibration (reliability + ECE)
+- **User directive:** add a calibration cell (follows the proba-column work
+  below). New markdown `## Figure 4` + code cell appended after the Fig 3
+  confusion-matrix cell.
+- **What it shows:** 1×3 reliability diagrams (one panel per model),
+  `calibration_curve(..., n_bins=10, strategy="quantile")` per variant —
+  standard in `GREY`, survey-weighted in the `mako` `ACCENT`, grey dashed
+  `y=x` perfect-calibration reference. Each variant's **ECE** (10 uniform
+  bins, count-weighted) is direct-labeled in the legend, per the design
+  notes' prefer-direct-labels rule. `set_box_aspect(1)` keeps each panel
+  square so the 45° reference reads correctly.
+- **Hard dependency:** reads `predicted_proba_{variant}` from the `labeled`
+  dict (loaded in the Fig 2 cell). **The labeled parquets on disk are still
+  the old binary-only 3-column files** — this cell raises `ColumnNotFound`
+  until each model's `--mode test` is re-run with the updated drivers (see
+  entry below). Cell has a comment saying so.
+- **Design choice — unweighted calibration.** The reliability curve + ECE
+  are computed on the test sample as-is (not population-weighted). Cleanest,
+  most conventional read; a population-weighted reliability diagram (bins
+  weighted by `State population`) is the natural follow-up if a reviewer
+  asks "calibrated w.r.t. which population?".
+- **Verified** the `calibration_curve` return order (`frac_pos, mean_pred`)
+  and the `ece` helper on a 20k-row synthetic `(y, prob)` — no errors,
+  sensible ECE. **Not** rendered in Jupyter and **not** run against real
+  proba columns yet (they don't exist on disk until a re-test). Open in
+  Jupyter after re-running test mode; spot-check the quantile binning
+  doesn't collapse to too few points on the low-probability mass (disability
+  base rate ~12%, so probs cluster low — quantile strategy handles this, but
+  ties can merge bins, as seen in the synthetic check where 10 bins → 8
+  points).
+
+### 2026-07-10 — all three model drivers: proba+binary output, random search (class weighting is a hyperparameter)
+- **User directive:** (1) labeled test outputs must carry *both* the
+  `predict_proba` output and the binary predictions; (2) set up all three
+  drivers for random-search hyperparameter tuning in which **use of class
+  weighting is itself a searched hyperparameter**.
+- **Output schema change (test mode).** The labeled parquet now has **5
+  columns** (was 3): `TARGET`, plus per variant
+  `predicted_proba_{variant}` (Float32 probability) and
+  `predicted_disability_{variant}` (Int8 binary at `--threshold`). Ordered
+  proba-then-binary per variant. This unblocks the calibration/ECE figure
+  that was stalled on binary-only outputs (see Fig-1 entry below). Any
+  consumer reading the old 3-col schema still finds the two binary columns
+  under the same names.
+- **Random search (re-introduces a stratified val split — reverses the
+  2026-07-02 "reduce complexity" one-shot-fit decision, per explicit user
+  directive).** Per variant: `train_test_split(..., test_size=0.1,
+  stratify=y, random_state=42)`, draw `--n-iter` random configs (seeded
+  `np.random.default_rng(42)`), score each on the val split by ROC-AUC —
+  **survey-weighted ROC-AUC for the `survey_weighted` variant, unweighted
+  for `standard`** — keep the best, then **refit the best config on the
+  full input** and log that model. One MLflow run per variant as before,
+  now with a `val_roc_auc` metric and the best hyperparameters as params
+  (`search="random"`, `n_iter`).
+- **Class weighting as a hyperparameter — per model:**
+  - **LR** (`logistic_regression.py`): `class_weight ∈ {"balanced", None}`
+    plus `C ~ log-uniform[1e-3, 1e1]`.
+  - **XGB** (`xgb.py`): `use_class_weight ∈ {True, False}` toggles
+    `scale_pos_weight` between the balanced `neg/pos` value and `1.0`; also
+    searches `n_estimators∈[50,300]`, `max_depth∈[3,10]`, `learning_rate`
+    log-uniform[0.01,0.32], `subsample`/`colsample_bytree`∈[0.6,1.0].
+  - **NN** (`neural_network.py`): `use_class_weight ∈ {True, False}` toggles
+    whether the balanced `compute_sample_weight` factor is folded into the
+    per-sample loss weights; also searches `hidden ∈ {(64,32),(128,64),
+    (128,64,32)}`, `dropout∈[0.1,0.5]`, `weight_decay` log-uniform[1e-5,
+    1e-3], `lr` log-uniform[1e-4,~3e-3]. Search trials use
+    `SEARCH_EPOCHS=8`; the final refit uses `EPOCHS=15`. Refactored the
+    training loop into `train_mlp(...)` reused by both search trials and the
+    final fit; `MLP.__init__` now takes explicit `hidden`/`dropout` (no
+    module-level `HIDDEN`/`DROPOUT` constants).
+  - Survey weighting is **orthogonal** to the class-weight hyperparameter:
+    the `survey_weighted` variant still multiplies in `State population`
+    (via `sample_weight` for LR/XGB, via the loss-weight tensor for NN)
+    regardless of the sampled `use_class_weight`/`class_weight`.
+- **New CLI flag `--n-iter`** (default: LR/XGB 20, NN 15) on all three, so
+  search cost is tunable without editing the file. NN is the expensive one
+  (each trial is a full 8-epoch fit × 2 variants) — dial `--n-iter` down
+  there first.
+- **Verified** via `py_compile` (all three) **and** an end-to-end smoke run
+  of train+test for all three on a 600-row synthetic parquet (`--n-iter
+  3–4`): no errors, and each wrote the 5-column labeled parquet with the
+  proba(Float32)+binary(Int8) schema above. **Not** run on the real 250K
+  train / 33M test parquets — do a real train+test cycle (keep exporting
+  `MLFLOW_TRACKING_URI=file:///Users/dpham/mlruns_ml_pipeline`, the APFS
+  store) before trusting the tuned numbers, and re-run `create_figures.ipynb`
+  after so it reads the freshly-tuned runs + new proba columns.
+
+### 2026-07-10 — `create_figures.ipynb`: Fig 1 → 2×3 Δ grid (unweighted / survey-weighted eval)
+- **User directive (after one redirect):** keep Fig 1 as the original
+  `Δ = treatment − control` bar chart with a baseline reference line, but
+  stack it into two rows — **top row deltas computed on the unweighted
+  metrics, bottom row deltas on the survey-weighted (`weighted`) metrics**
+  from the MLflow-derived `metrics_df`.
+- **What changed:** the cell (id `fig2`) is now a 2×3 grid. Columns =
+  `MODEL_ORDER`; each panel shows the five metrics' Δ (survey_weighted −
+  standard) as horizontal bars. `delta_df` is pivoted once over
+  `["model","weighting","metric"]`; the row loop just filters
+  `weighting ∈ {"unweighted","weighted"}`. `xmax` is computed across *both*
+  weightings so the shared x-axis (`sharex=True`) fits every bar+label.
+- **Baseline line is dotted** (`axvline(0, linestyle=":", linewidth=0.9)`) —
+  the original was solid `0.6`; user called it a "baseline dotted line".
+- **Design language preserved:** grey base, `mako` ACCENT for |Δ| > 0.005,
+  left spine off, y-ticks length 0, inverted y. Row labels ("Unweighted
+  metrics" / "Survey-weighted metrics") via 90°-rotated `annotate` at axes
+  fraction `(-0.42, 0.5)` on the left column; model titles on the top row.
+- **Suptitle:** "Survey-Weighted − Standard Metric Differences (Unweighted
+  vs Survey-Weighted Evaluation)".
+- **Note on `metrics_df.weighting`:** values are `"unweighted"` / `"weighted"`
+  (from the `test_{weighting}_{metric}` MLflow key split), *not*
+  `"population-weighted"` — that latter label only exists in Fig 2's
+  separately-built `rate_df`.
+- **Interrupted brainstorm follow-up:** user had picked Calibration/ECE and
+  per-state/subgroup gap figures to draft next, but redirected before those
+  were built. **Calibration/ECE is currently blocked** — the
+  `data/test_labeled_*.parquet` files store *binary* (i8 0/1) predictions,
+  not probabilities, so reliability diagrams/ECE need the model drivers to
+  emit a probability column first (breaks the 3-column output contract —
+  ask before doing). Per-state gaps *are* feasible: `data/test.parquet` has
+  `State (FIPS code)_*` one-hot columns (529 cols total) joinable to
+  predictions by row order.
+- **Not visually verified.** Open in Jupyter, run all cells. Spot-check that
+  the widest `+0.NNN` value labels stay inside `±xmax` and the rotated row
+  labels clear the y-tick metric labels; widen left `tight_layout` margin
+  past `0.03` if they collide.
+
+### 2026-07-03 — `create_figures.ipynb`: Fig 3 legend overlap + relabel
+- **User-reported overlap:** legend (`loc="lower right"` on `axes[0]`) sat
+  directly on top of the Logistic Regression rows in the left panel, hiding
+  the "0.280" value label and the standard-fitting bar. Root cause: with
+  `xlim=(0, 0.58)` and Logistic Regression's standard-fitting bar reaching
+  0.280, the axes-relative "lower right" corner falls right on top of the
+  bars.
+- **Fix:** moved the legend to a figure-level `fig.legend(..., loc="lower
+  center", bbox_to_anchor=(0.5, -0.02), ncol=3)` under both panels.
+  Reserved bottom 8% of the layout via `tight_layout(rect=[0, 0.08, 1,
+  0.93])` and bumped `figsize` height 3.6 → 3.8 to keep the axes area from
+  compressing. Legend now sits below both x-labels, single row, no
+  overlap possible with any bar.
+- **X-axis label:** "Share of test rows predicted positive" → "True
+  Positive Rate" per user directive. (Note: this is a slight terminology
+  overload — TPR classically means recall / sensitivity, not the overall
+  positive-prediction rate. User asked for this phrasing explicitly; keep
+  it unless the paper's methods section pushes back.)
+- **Suptitle:** "Positive-prediction rates by model" → "Predicted
+  Disability Rate & Actual Disability Rate". User's phrasing preserved
+  verbatim including the ampersand.
+
+### 2026-07-03 — `create_figures.ipynb`: Fig 1 label clipping + new title
+- **User-reported clipping:** "Logistic Regression" left-endpoint label was
+  getting cut off at the figure edge (visible in the rendered PNG the user
+  attached). Root cause: `xlim=(-0.75, 1.75)` + right-aligned label at
+  `x=-0.06` meant the longest label ("Logistic Regression  0.655") extended
+  past `x=-0.75` and hit the axes-area left edge.
+- **Fix:** widened `xlim` to `(-1.15, 1.75)` (+0.4 units of headroom on the
+  left) and bumped `figsize` width from 6.4 → 7.2 so the extra data-space
+  actually translates to visible inches. Label positions unchanged (still
+  right-aligned at `x=-0.06`), so leader lines and label vertical spacing
+  are untouched.
+- **Title:** "Survey-weighted fitting reduces ROC-AUC across all three
+  models" → "ROC-AUC Across Standard & Survey-Weighted Models". Same
+  descriptive-not-interpretive shape as the Fig 3 rename earlier today; the
+  ampersand + title case is the user's chosen phrasing.
+
+### 2026-07-03 — `create_figures.ipynb`: Fig 3 clarity pass (dotted-line legend, shorter title)
+- **Suptitle broadened + shortened:** "Survey-weighted fitting nudges predictions
+  toward the population base rate" → "Positive-prediction rates by model". The
+  old title was an interpretation; the new one just names what the figure
+  shows. Interpretation belongs in surrounding paper prose (previously it
+  lived in the deleted markdown cell), not in the plot chrome.
+- **Dotted reference line pulled into the legend** as a `Line2D` proxy with
+  label "Actual disability rate in test data (12.1%)". Removed the loose
+  axes[1] `ax.text(..., "true rate = 0.121", ...)` annotation that was doing
+  double duty as a legend entry — it was easy to miss and didn't say what
+  rate it was. Legend now carries all three visual roles (grey bar, mako
+  bar, dotted line) in one place.
+- **Legend labels expanded:** "standard" → "Standard fitting",
+  "survey-weighted" → "Survey-weighted fitting". Explicit that these are
+  training regimes, not data columns.
+- **Subplot titles clarified:** "unweighted" → "Sample average (equal weight
+  per row)"; "population-weighted" → "Population-weighted (by state
+  population)". Old titles named the aggregation but not what the
+  aggregation is doing.
+- **X-axis label clarified:** "positive-prediction rate" → "Share of test
+  rows predicted positive". Same value, plain-language phrasing.
+- **Small layout bumps:** figsize height 3.4 → 3.6 to give the widened legend
+  room; dotted-line linewidth 1.0 → 1.2 so the legend proxy and the plotted
+  line read as the same weight.
+- **Not visually verified.** Same caveat as prior notebook edits — open in
+  Jupyter, run all cells, spot-check that the legend fits inside the lower-
+  right of the left panel without overlapping the "Neural Network" row's
+  value labels. If it collides, move the legend to `loc="upper right"` on
+  axes[1] instead.
+
+### 2026-07-03 — `create_figures.ipynb`: strip markdown blurbs, drop file saving, Arial font
+- **Deleted the four figure-description markdown cells** (`fig1-md`, `fig2-md`,
+  `fig3-md`, `fig4-md`). The `intro` and `load-md` markdown cells remain. Story
+  now lives in the plot titles + suptitles only; per-figure explanatory prose
+  is gone from the notebook. If the prose ever needs to come back (e.g. for a
+  paper draft handoff), pull it from git history (`git show HEAD~1 --
+  create_figures.ipynb`).
+- **Removed `figures/` output.** No more `FIG_DIR`, no `save_fig` helper, no
+  `fig.savefig(...)` calls in any of the four figure cells. The notebook is
+  now display-only — cells render inline via `plt.show()` and that's it. Any
+  downstream consumer that needs `.pdf` / `.png` files will have to re-add a
+  savefig call (or export from Jupyter's UI).
+- **Setup cell simplified:** dropped `savefig.dpi`, `savefig.bbox`, the
+  `pathlib` import, `FIG_DIR.mkdir`, `save_fig`, and the two color-role
+  block-comments. Kept env vars, imports, sns.set_theme, minimal rcParams,
+  colors, MODELS dict, constants.
+- **`load-metrics` cell simplified:** inlined the `latest_test_run` function
+  into the two nested loops. `client.get_experiment_by_name` now runs once per
+  model instead of once per (model, variant). Same output DataFrame.
+- **Font swapped to Arial.** `plt.rcParams["font.family"] = "Arial"` (was
+  `serif`). Note: Arial isn't shipped by matplotlib — the user's macOS host
+  has it in the system font path, so `find_font` resolves it; on other hosts
+  a `findfont: Font family 'Arial' not found` warning falls back to
+  DejaVu Sans. If the notebook ever runs inside the `python:3.12-slim`
+  Docker image, install `msttcorefonts` or swap to `Liberation Sans` / a
+  bundled font.
+- **Not visually verified.** Same pattern as prior notebook edits — cell
+  source round-trips through `NotebookEdit`, but the actual rendering (Arial
+  substitution, layout without the deleted markdown cells breaking up the
+  flow) hasn't been checked in Jupyter. Open the notebook, run all cells,
+  spot-check that the four figures still render and that no font-fallback
+  warnings surface.
+
+### 2026-07-02 — `create_figures.ipynb`: fix overlapping text across all four figures
+- **Trigger:** user reported overlapping text in the notebook. After the reduced-
+  complexity model pass earlier today, the three models' test-set ROC-AUC
+  values cluster tightly (standard: 0.655 / 0.645 / 0.645; survey-weighted:
+  0.618 / 0.647 / 0.636), which broke the slopegraph's endpoint labels — all
+  three model names and all three value strings piled on top of each other at
+  each end. Fig 2/3/4 also had latent suptitle/`tight_layout` collisions that
+  become visible once the plain `plt.tight_layout()` reflows the axes without
+  reserving space for the fig-level title.
+- **Fig 1 (slopegraph):**
+  - Anti-collision routine (`spread`) shifts label y positions so no two labels
+    sit within `0.55 × data_span` of each other. Enforced independently for
+    the left and right endpoint stacks.
+  - Distinct mako shades per model (indices 1/3/4) so overlapping line
+    trajectories are still visually distinguishable. Design language preserved
+    — mako, no chroma outside the palette.
+  - Leader lines (thin, alpha 0.6, per-model color) connect nudged labels back
+    to their endpoint whenever the shift is meaningful (>1e-4 data units).
+  - Explicit `ylim` computed from the union of endpoint and label y-values plus
+    padding, so leader lines aren't clipped.
+  - `xlim` widened to `(-0.75, 1.75)` from `(-0.55, 1.6)` so the shifted labels
+    have room to sit clear of the endpoints.
+- **Fig 2 (Δ bars):** replaced `plt.tight_layout()` with `fig.tight_layout(rect=
+  [0, 0, 1, 0.93])` and moved the suptitle to `y=0.995` so the axes reserve the
+  top 7% for the title. `xmax` widened from `1.35×` to `1.45×` so value labels
+  at bar ends stay inside the spine.
+- **Fig 3 (positive-rate):**
+  - Dropped the ad-hoc `ax.text(..., y=-0.9, ...)` "direct labels" for the two
+    variants — they were being drawn in data-space above the top of the axis
+    where they collided with each panel's title. Replaced with a proper
+    `matplotlib.patches.Patch` legend in the lower-right of the left panel.
+  - Reference-line label moved into `axes[1]` next to the line, at `y=2.55`
+    (below the last bar row, above the axis edge).
+  - Same `fig.tight_layout(rect=...)` treatment as Fig 2 for the suptitle.
+  - `xlim` bumped `0.56 → 0.58` for the widest value labels.
+- **Fig 4 (confusion matrices):**
+  - Model-name row labels moved off the y-axis `set_ylabel` (where they were
+    being combined with `\nactual` and crowding the "no"/"yes" tick labels)
+    onto an `annotate(..., xycoords="axes fraction")` positioned at
+    `(-0.32, 0.5)` with `rotation=90`, so the model name gets its own space to
+    the left of the yticklabels.
+  - `set_ylabel("actual")` retained on the left column only, still small
+    (fontsize 9), no longer collides with the model-name annotation.
+  - `fig.tight_layout(rect=[0.04, 0, 1, 0.965])` reserves both the top for the
+    suptitle and a small left margin for the annotate-based row labels.
+  - figsize nudged `6.4×8 → 6.6×8.2` for the extra left column.
+- **Not visually verified.** Same pattern as the two earlier notebook edits
+  today — notebook JSON round-trips fine, but rendering (leader-line
+  angles, anti-collision spacing under the actual axis aspect, the Patch
+  legend's position relative to the reference-line label in Fig 3) has not
+  been visually checked. Open in Jupyter, run all cells, spot-check the
+  eight `figures/fig{1..4}.{pdf,png}` outputs before publishing.
+
+### 2026-07-02 — `create_figures.ipynb` design pass per user's data-viz notes
+- **Trigger:** user said the figures looked "AI" and pointed me at their Obsidian
+  Zettelkasten note tree rooted at `~/Documents/Notes/3 - Zettelkasten/Data
+  Visualization.md`. The linked notes lay out a Cole Nussbaumer Knaflic style
+  framework: exploratory vs explanatory analysis, choosing effective visuals,
+  clutter/cognitive load, preattentive attributes, design thinking,
+  storytelling with data.
+- **Diagnosis of the old notebook:** it was exploratory-dump-style — six figures
+  covering every angle (results grid, delta, positive-rate, agreement,
+  confusion matrices, disagreement diagnostics), all using the same mako-pair
+  palette uniformly, all bars labeled, formal-but-empty titles ("Figure 1 —
+  Test-set performance"). No visual hierarchy, no story arc, no strategic
+  color, no direct labels.
+- **What changed:**
+  - **Cut from 6 to 4 figures.** Dropped the prediction-agreement heatmap and
+    the disagreement diagnostics — both were exploratory ("here's another way
+    to slice it") rather than explanatory. Pearls, not opened oysters.
+  - **Slopegraph replaces the ROC-AUC bar chart** (Fig 1). The Zettelkasten's
+    Choosing Effective Visuals note calls out slopegraphs as the right chart
+    when comparing exactly two conditions across a small set of categories —
+    line direction + length encode sign and magnitude directly, no
+    subtraction required. Also sidesteps the "bars must start at zero"
+    tension for a bounded metric like AUC where 0.5 is the chance floor.
+  - **Grey + one mako accent, not all-mako.** Per Preattentive Attributes:
+    grey as the default for context, one strategic color to highlight the
+    treatment being evaluated (`ACCENT = mako[2]`). Standard variant is the
+    reference (grey); survey_weighted is the intervention under evaluation
+    (mako accent). Fig 2 additionally greys out delta bars where |Δ| < 0.005
+    so the eye is drawn to the meaningful ones.
+  - **Big Idea titles.** Each figure now has a complete-sentence title
+    stating the finding, not just the topic. Fig 1: "Survey-weighted fitting
+    reduces ROC-AUC across all three models." Fig 3: "Survey-weighted
+    fitting nudges predictions toward the population base rate."
+    Interpretation lives in these titles and the markdown captions; the plots
+    themselves are quiet.
+  - **Direct labels over legends where practical.** Fig 3 puts "standard"
+    and "survey-weighted" text labels in the accent colors directly on the
+    plot instead of a legend the eye has to keep referencing. Fig 1 labels
+    the two endpoints and the model names on the plot itself.
+  - **Chart-junk reduction.** Removed top/right spines globally. Left spine
+    off on horizontal bar plots and slopegraphs (baseline is the value axis,
+    not the category axis). Y-axis grid on the slopegraph only, in
+    `#e6e6e6`. Tick marks removed from categorical axes.
+  - **Font sizes tuned smaller.** `context=\"paper\"` with `font_scale=1.0`.
+    Annotations dropped to 7.5–9pt to reduce the visual noise of the old
+    version's `bar_label(fmt=\"%.2f\", fontsize=8)` on every bar.
+  - **Kept:** `mako` colormap on Fig 4's confusion-matrix heatmaps (natural
+    fit — sequential data, sequential palette). Row-normalized to percent so
+    the six matrices are directly comparable.
+- **File count is `figures/fig{1..4}_*.{pdf,png}`** (8 files after a run).
+  Fig-1 through Fig-4 numbering matches the paper draft's figure order.
+- **Structural changes for future edits to `create_figures.ipynb`:**
+  - Do NOT reintroduce the deleted panels without a specific narrative reason.
+    "Comprehensive" isn't a narrative reason — this is explanatory analysis,
+    not a data dump.
+  - Do NOT default to all-mako or all-colorful. Grey is the base state; mako
+    accent is reserved for the treatment being evaluated. Same color = same
+    meaning across the four figures.
+  - Do NOT restore per-bar `bar_label` on every element. Only label values
+    that matter to the story.
+  - Complete-sentence titles state findings; markdown captions above each
+    figure explain method and interpretation. Do not merge the two.
+- **Still not smoke-tested end-to-end.** Same as the earlier attempt today,
+  user's channel signal is "don't run this headless — open it in Jupyter." So
+  the notebook JSON validates but figure rendering (label positioning,
+  slopegraph endpoint annotation collisions, tight_layout warnings) has not
+  been visually verified. Open in Jupyter, run all cells, spot-check
+  `figures/fig{1..4}.pdf` before dropping into LaTeX.
+
+### 2026-07-02 — model simplification + `create_figures.ipynb` for paper
+- **User directive after two tuning passes plateau'd around AUC 0.65:** "reduce
+  complexity of the 3 models." Ran the analysis, confirmed the improvements
+  from val-split/early-stop/hyperparameter sweeps landed marginal test-set
+  gains (\<0.005 AUC on top of the "improvements pass" v1 numbers). Rolled
+  back the val-split ceremony to fixed-hyperparameter one-shot fits that
+  match what tuning had settled on.
+- **`logistic_regression.py`:** dropped `C_GRID` sweep + stratified val
+  split + refit. Single `C = 0.01` (that was the tuned pick anyway) applied
+  to both variants. **149 lines** (was 187).
+- **`xgb.py`:** dropped stratified val split, `eval_set`, `early_stopping_rounds`,
+  `reg_alpha`, `reg_lambda`, `min_child_weight` custom, learning_rate=0.1
+  (was 0.05), `n_estimators = 100` (was 1000 with early stop, which typically
+  picked ~100). `eval_metric` back to `logloss`. **179 lines** (was 220).
+- **`neural_network.py`:** dropped val split, val-loss tracking, best-state
+  snapshotting, patience-based early stopping. Smaller network `HIDDEN =
+  (64, 32)` (was 128,64,32), fixed `EPOCHS = 15` (matches what val-loss
+  early stop picked), `DROPOUT = 0.3` (down from 0.5 — smaller net doesn't
+  overfit as hard, so less dropout needed). **228 lines** (was 253).
+- **Test-set impact:** LR unchanged (AUC 0.655 std / 0.617 sw), XGB
+  standard dropped 0.008 (0.653 → 0.645), NN essentially flat (0.646 →
+  0.645 std, 0.642 → 0.636 sw). All three now cluster within 0.02 of
+  AUC 0.65. **The tuning ceremony was not load-bearing for the results
+  observed at this feature-engineering budget.** If future feature work
+  (interaction terms, target-encoded high-card cats) pushes the ceiling up,
+  the tuning may become worthwhile again — restore from git history.
+- **New: `create_figures.ipynb`.** Publication-focused notebook that
+  regenerates six figures from the latest MLflow test runs plus the labeled
+  test parquets:
+  - Fig 1 — per-metric bar grid (row=model, col=weighting scheme).
+  - Fig 2 — Δ(standard − survey_weighted) per metric per model.
+  - Fig 3 — positive-prediction rate, unweighted vs population-weighted.
+  - Fig 4 — 2×2 prediction-agreement heatmap per model.
+  - Fig 5 — 3×2 confusion matrix grid.
+  - Fig 6 — on disagreement rows, who is right.
+  All figures use seaborn's `mako` palette (two shades for the standard/
+  survey-weighted contrast, three shades for the model contrast, `mako`
+  colormap for heatmaps). Saved to `figures/` as both `.pdf` (vector, for
+  LaTeX inclusion) and `.png` (300 dpi raster preview).
+- **MLflow query pattern in the notebook:** uses
+  `filter_string="attributes.run_name = '<variant>_test'"` with
+  `max_results=1`, per user directive — explicitly the *latest* test run
+  per (model, variant), not "most recent among all runs then dedup by
+  run_name." Same store as the training scripts
+  (`$HOME/mlruns_ml_pipeline`); override via `MLFLOW_TRACKING_URI` if the
+  APFS location changes.
+- **Notebook style choices for the paper:** `sns.set_theme(context="paper",
+  style="whitegrid", font_scale=1.05)`, serif family, top/right spines off,
+  savefig dpi 300, tight bbox. Figure titles are formal ("Figure N —
+  descriptive noun phrase"); interpretation lives in the markdown captions
+  above each figure, not in the plot titles themselves. When the notebook
+  is edited: preserve this split (plot titles = what, markdown captions =
+  why/how), since captions map cleanly to LaTeX `\caption{}` when the
+  figures are lifted into the paper.
+- **Not smoke-tested end-to-end.** User rejected two headless test attempts
+  earlier in the session (the sequence with `nbconvert`-style exec-cells
+  runners). The notebook JSON validates and each code cell is syntactically
+  correct, but the actual figure rendering (label overlaps, mako-on-white
+  text visibility on the heatmap annotations, `catplot` legend removal) has
+  not been visually verified. **First-run TODO:** open the notebook in
+  Jupyter, run all cells top-to-bottom, and check the six `figures/fig*.pdf`
+  outputs before dropping them into the paper.
+
+### 2026-07-02 — regularization pass on all three models + new APFS mlruns store
+- **User directive:** "improve the three models and rerun train and test." Previous
+  test-set results showed catastrophic overfitting in NN (train AUC 0.95 → test
+  0.55), moderate overfitting in XGB (0.74 → 0.63), clean but plateau'd LR (0.66
+  → 0.63). Each script now uses a stratified 90/10 train/val split for early
+  stopping / hyperparameter selection; same seed (`SEED=42`) so the split is
+  reproducible per script.
+- **`neural_network.py`:** added `DROPOUT=0.3` between hidden layers,
+  `WEIGHT_DECAY=1e-4` on the Adam optimizer, and — critically — **early stopping
+  on val loss, not train loss.** The prior `EARLY_STOP_PATIENCE=10` on train
+  loss did nothing to prevent overfit because train loss monotonically decreases
+  even as val loss climbs. New loop tracks `best_val_loss`, snapshots the
+  matching `state_dict`, restores it at end of training, and logs `val_loss` +
+  `train_loss` per epoch to mlflow. Both variants early-stopped in ~17–19
+  epochs — val loss started rising almost immediately, confirming the model had
+  been badly overfit before.
+- **`xgb.py`:** switched to `early_stopping_rounds=30` on a held-out val set via
+  `eval_set` + `sample_weight_eval_set`. Bumped `n_estimators=1000` (ceiling)
+  and dropped `learning_rate=0.05` (was 0.1). Added `min_child_weight=5`,
+  `reg_alpha=0.1`, `reg_lambda=1.0`. `eval_metric` changed to `auc` so early
+  stopping targets the same metric we care about downstream. Both variants
+  early-stopped: standard @ 116 iterations, survey_weighted @ 25 (survey-
+  weighted eval AUC saturated fast — weighting concentrates gradient signal on
+  a few high-pop rows, easy to overfit).
+- **`logistic_regression.py`:** added a `C ∈ {0.01, 0.1, 1.0, 10.0}` sweep on
+  the val split, pick best by val ROC-AUC, refit on the full train set with the
+  chosen `C`. Everything else unchanged. Standard picked `C=0.01` (heavy
+  regularization); survey_weighted picked `C=0.1`.
+- **Test results (all on `data/test.parquet`, 33.17M rows, threshold=0.5):**
+  | Model | Variant | ROC-AUC (u) prev → new | Δ | F1 (u) prev → new | Recall (u) prev → new |
+  |---|---|---|---|---|---|
+  | LR | standard | 0.631 → **0.655** | +0.024 | 0.248 → 0.274 | 0.339 → 0.465 |
+  | LR | survey_weighted | 0.615 → 0.618 | +0.003 | 0.235 → 0.239 | 0.335 → 0.353 |
+  | XGB | standard | 0.628 → 0.653 | +0.025 | 0.249 → 0.272 | 0.356 → 0.516 |
+  | XGB | survey_weighted | 0.620 → 0.647 | +0.027 | 0.236 → 0.268 | 0.303 → 0.507 |
+  | NN | standard | 0.546 → **0.645** | **+0.099** | 0.139 → 0.267 | 0.131 → 0.445 |
+  | NN | survey_weighted | 0.535 → 0.642 | **+0.107** | 0.135 → 0.266 | 0.122 → 0.462 |
+
+  NN went from near-random to competitive with LR/XGB; the win is entirely from
+  val-loss early stopping (dropout + weight decay help but the loop *has* to
+  stop at ~epoch 8–10 or the model collapses). All three models are now
+  clustered around AUC 0.64–0.66 — the ceiling on this feature set with the
+  current pipeline. Further gains likely need feature engineering (interaction
+  terms, target-encoded high-cardinality cats we dropped) or a different model
+  family.
+- **New runs landed in `$HOME/mlruns_ml_pipeline`, not `ml_pipeline/mlruns/`.**
+  The AppleDouble `._*` recreation-on-write on the ExFAT drive crashed mlflow
+  reads with `UnicodeDecodeError` mid-run even after cleaning sidecars (macOS
+  regenerates them on every write). Fell back to the documented escape hatch:
+  `MLFLOW_TRACKING_URI=file:///Users/dpham/mlruns_ml_pipeline` for the whole
+  session (train + test). **This means the previous runs in
+  `ml_pipeline/mlruns/` are stranded on the external drive and the current
+  results only live in APFS.** Future train/test cycles need to keep exporting
+  the same env var, or migrate the APFS store back to the external drive once
+  a workaround for AppleDouble is found. The tracking URI default in the three
+  scripts still points at `ml_pipeline/mlruns/` — override each invocation.
+- **Voice note for future edits to these three drivers:** the user's terse
+  preference caught up with me on the inline `# comments` explaining constants
+  during the 2026-06-25 NN speedup pass (trimmed post-edit). This time I kept
+  brief inline comments only where they explain *why* (the val-split rationale,
+  the pre-computed min/max reasoning-analog for XGB early stopping). If those
+  get trimmed too, drop them going forward and keep the why in the Changelog.
+
+### 2026-06-25 — NN speedup pass + tqdm progress bars across all three drivers
+- **`neural_network.py` train mode — speedup.** Aim: cut wall time on the Mac
+  host venv without changing the model. Changes:
+  - **MPS-aware device selection.** Added an `mps` branch between `cuda` and
+    `cpu`, so Apple Silicon hosts use the GPU. Inside Docker (Linux on CPU)
+    behavior is unchanged.
+  - **Dropped `DataLoader` + `TensorDataset`.** Pure-Python per-batch
+    iteration plus repeated `.to(device)` copies were the main per-step
+    overhead at `BATCH_SIZE=1024`. Replaced with: full `X` / `y` / sample
+    weights moved to device once, `torch.randperm(n, device=device)` each
+    epoch for shuffle, manual index slicing per batch. With `Float32` X at
+    250K × ~548 features that's ~548 MB resident on device — fits on MPS /
+    CPU comfortably.
+  - **`BATCH_SIZE` 1024 → 8192.** 8× fewer steps per epoch (244 → 31), much
+    less Python overhead. `PREDICT_BATCH = 16_384` now controls inference
+    batch size independently (was tied to `BATCH_SIZE * 4`).
+  - **Early stopping on training-loss plateau.** Tracks the per-epoch mean
+    loss; if no improvement of more than `EARLY_STOP_MIN_DELTA = 1e-4` for
+    `EARLY_STOP_PATIENCE = 10` epochs, the loop breaks. `EPOCHS = 200` stays
+    as the ceiling. Number of epochs actually trained is logged to mlflow
+    as `trained_epochs`.
+  - **Per-batch `loss.item()` removed from the inner loop** (was a forced
+    GPU→CPU sync each step on MPS). Loss accumulated into a device-side
+    scalar tensor and `.item()`'d once per epoch for the early-stop check
+    and the tqdm postfix.
+  - **Not verified end-to-end yet.** `py_compile` passes; rebuild the
+    Docker image (new `tqdm` dep) and run `python neural_network.py --mode
+    train data/train_processed.parquet` then `--mode test` to confirm.
+- **`tqdm` progress bars added to all three model drivers.** Pinned in
+  `requirements.txt` (unpinned version, resolves on first install).
+  - **`neural_network.py`:** per-epoch bar in train mode (`desc=f"train
+    {variant}"`, postfix shows current and best loss); per-parquet-batch
+    bar in test mode (`desc="test nn"`, `total = ceil(num_rows /
+    TEST_BATCH)` from `ParquetFile(...).metadata.num_rows`).
+  - **`logistic_regression.py`:** `for variant in tqdm(VARIANTS, desc="train
+    lr")` in train mode (sklearn's single `.fit()` has no per-iteration
+    hook — variant-level is the only progress signal available); per-batch
+    bar in test mode (`desc="test lr"`).
+  - **`xgb.py`:** custom `TqdmCallback(xgb.callback.TrainingCallback)` ticks
+    once per boosting round and closes the bar in `after_training`, wired
+    via `XGBClassifier(callbacks=[TqdmCallback(total=200, desc=f"train xgb
+    {variant}")])`. Per-batch bar in test mode (`desc="test xgb"`).
+- **Voice cleanup after the edit:** explanatory inline comments I added on
+  constant declarations (e.g. `EPOCHS = 200  # ceiling...`) were trimmed
+  back to bare values by the user post-edit, consistent with the
+  terse-voice preference. Future edits to these scripts: don't reach for
+  inline `#` comments to explain constants; the changelog is the right
+  place for the "why".
+
+### 2026-06-25 — eda.ipynb: polars swap
+- Swapped `pandas` → `polars` in the EDA notebook to match the rest of the
+  pipeline's stack. Cell-by-cell:
+  - Imports: `import pandas as pd` → `import polars as pl`.
+  - Load: `pd.read_parquet(path)` → `pl.read_parquet(path)`.
+  - Num/cat split: previously `df.describe().columns` (pandas trick to grab
+    numeric cols) → `[c for c in df.columns if df[c].dtype.is_numeric()]`.
+    `num_df = df.select(num_features)`, `cat_df = df.drop(num_features)`.
+  - Rename uses polars' `df.rename({old: new, ...})` (dict, no `inplace`),
+    filtered to keys actually present in `cat_df` so it doesn't `KeyError`
+    on cols dropped upstream (e.g. high-card cats).
+  - Correlation heatmap: `sns.heatmap(num_df.corr(), ...)` →
+    `sns.heatmap(num_df.to_pandas().corr(), ...)`. Polars has `.corr()` but
+    returns a label-less square frame; routing through `to_pandas().corr()`
+    keeps the seaborn axis labels with one extra method call.
+  - `cat_df.nunique().reset_index()` → explicit
+    `pl.DataFrame({"feature": cat_df.columns, "n_unique": [cat_df[c].n_unique() ...]})`.
+    Polars' `df.select(pl.all().n_unique()).transpose(...)` works too but
+    reads more obscurely; the dict-constructor form matches the rest of
+    the notebook's directness.
+  - `value_counts(normalize=True)` → `value_counts(sort=True, normalize=True)`.
+    Polars supports `normalize` on `Series.value_counts` as of 0.20.x;
+    `sort=True` preserves the descending-by-count display order pandas gave
+    by default.
+- **Why:** user directive — align EDA with the polars-only stack used by
+  `data_processing.py` and the model drivers; drops `pandas` as a runtime
+  dep for this notebook (still needed transitively for the heatmap step).
+- **Not re-executed.** Outputs in the notebook are from the prior pandas
+  run and are now stale. Re-run cells in order against a valid input
+  parquet to refresh them.
+
+### 2026-06-25 — model scripts: descriptive labeled-output suffixes
+- Test-mode output filenames now spell out the model used:
+  - `logistic_regression.py`: `<stem>_labeled.parquet` →
+    `<stem>_labeled_logistic_regression.parquet`
+  - `xgb.py`: `<stem>_labeled_xgb.parquet` →
+    `<stem>_labeled_xgboost.parquet`
+  - `neural_network.py`: `<stem>_labeled_nn.parquet` →
+    `<stem>_labeled_neural_network.parquet`
+- **Why:** user wants the output filename to identify the model that
+  produced the predictions at a glance, rather than relying on terse
+  suffixes / no suffix at all.
+- All three scripts continue to write into `./data/` and still produce the
+  same three-column schema (`TARGET`, `predicted_disability_standard`,
+  `predicted_disability_survey_weighted`).
+- Any prior `<stem>_labeled.parquet` / `_labeled_xgb.parquet` /
+  `_labeled_nn.parquet` files already on disk are not renamed; future test
+  runs land at the new paths.
+
+### 2026-06-25 — model scripts: streaming test mode (pyarrow row-batches)
+- **All three model drivers** (`logistic_regression.py`, `xgb.py`,
+  `neural_network.py`) now stream the input parquet in test mode instead of
+  materializing the full feature matrix. Train mode is unchanged — sklearn
+  LR, XGB `.fit()`, and the PyTorch training loop still need the full `X`
+  in memory.
+- **Why:** test on `_full.parquet` (and the upcoming larger splits) OOM'd
+  because `pl.read_parquet(...).drop(...).to_numpy()` materialised the
+  whole ~548-column dense matrix at once. At Float32 that's ~2.2 KB/row;
+  on a 10M-row split that's ~22 GB before any model touches it.
+- **Shape of the change:**
+  1. Top-level `df = pl.read_parquet(...)` / `X = df.drop(...).to_numpy()`
+     moved *inside* the `train` branch. Test branch never reads the full
+     frame.
+  2. Test branch loads both variants up front into a `loaded` dict, then
+     iterates `pq.ParquetFile(args.input).iter_batches(batch_size=BATCH)`
+     once. Per batch: convert to polars via
+     `pl.from_arrow(pa.Table.from_batches([batch]))`, slice off the
+     `(TARGET, TARGET_NEG, WEIGHT)` columns, `predict_proba` with each
+     loaded model, append the 1D prob slice to a per-variant list.
+  3. After the loop, `np.concatenate` the per-variant prob lists + `y` +
+     `w`, then compute metrics and write the labeled parquet exactly as
+     before.
+- **Peak memory in test mode** is now roughly `BATCH × n_features × 4 B`
+  (one batch of `X_b`) + `n_rows × 8 B × ~4` (y/w/prob arrays). At
+  `BATCH=50_000` and 548 features that's ~110 MB per batch + ~1.6 GB of
+  1D state at 50M rows — fits comfortably.
+- **Batch size:** `BATCH = 50_000` in LR/XGB, `TEST_BATCH = 50_000` in NN
+  (separate name to avoid clashing with the existing train-loop
+  `BATCH_SIZE = 1024`). Tune larger if the host has headroom and the
+  loader becomes I/O-bound; tune smaller if a single batch's X is still
+  too wide.
+- **Dependency:** `pyarrow` was already a pinned runtime dep (used
+  transitively by polars + by `data_processing.py`'s sink); both scripts
+  now import it explicitly as `pyarrow as pa` and `pyarrow.parquet as pq`
+  at the top.
+- **NN-specific:** `predict_proba(model, X_b)` still sub-batches into
+  `BATCH_SIZE * 4 = 4096`-row chunks internally for the GPU forward
+  pass. With file-level batching at 50K, that's just two layers of
+  batching — harmless, no rewrite needed.
+- **Metric semantics unchanged.** All five metrics (accuracy, precision,
+  recall, F1, ROC-AUC) and both their unweighted / survey-weighted
+  variants are still computed on the full concatenated `y` / `prob`
+  arrays at the end of the loop, so test runs are bit-identical to the
+  pre-streaming versions modulo floating-point accumulation order in the
+  `concatenate`.
+- **Output schema unchanged.** Same three columns (`TARGET`,
+  `predicted_disability_standard`, `predicted_disability_survey_weighted`)
+  written to the same `<input-stem>_labeled{,_xgb,_nn}.parquet` paths.
+- **Train mode is untouched in shape and verified by `py_compile` only.**
+  Run each script end-to-end after rebuilding (no Dockerfile change
+  needed; pyarrow is already in `requirements.txt`) to confirm the test
+  branch finishes within the new memory envelope.
+
+### 2026-06-25 — data_processing.py: streaming lazy pipeline, one-hot from codes
+- **Rewrote the pipeline as a single lazy plan ending in `sink_parquet`.** No
+  more `read_parquet` → loop → `collect()` → `to_dummies()` → `write_parquet()`.
+  Whole pipeline runs through polars' streaming engine.
+- **Why:** OOM'd on the 3 GB `_full.parquet`. Eager replace+to_dummies
+  materialised two giant frames in sequence (string-encoded labels, then the
+  wide one-hot output).
+- **Key changes:**
+  - `scan_parquet` instead of `read_parquet`.
+  - **One-hot from raw PUMS codes**, skipping the `replace` → `Categorical` →
+    `to_dummies` detour. For each col in `VALUE_LABELS`, emit
+    `(pl.col(c).cast(String) == code).cast(UInt8).alias(f"{COLUMN_LABELS[c]}_{label}")`.
+    Column names match the previous pipeline so `TARGET = "Disability
+    (recoded)_With a disability"` and friends still resolve.
+  - Non-numeric columns outside `VALUE_LABELS` (e.g. `ST` if string-typed)
+    handled via a small `unique().drop_nulls().implode()` pre-pass.
+  - MinMax outputs cast to `Float32` (was `Float64`).
+  - Compression: `lz4` (was the default). Faster writes; bigger file. Swap to
+    `lz4_raw` if polars rejects `lz4` on this version.
+- **Streaming-engine bailout fix.** `(col - col.min()) / (col.max() - col.min())`
+  inside the main plan broadcasts an aggregation back across rows; polars 1.6's
+  streaming engine doesn't support that, falls back to the standard engine,
+  which then refuses `sink_parquet` with
+  `InvalidOperationError: sink_Parquet ... not yet supported in standard engine`.
+  **Fix:** pre-compute min/max scalars in a one-shot aggregation
+  `lf.select([min/max exprs]).collect().row(0, named=True)`, then use them as
+  Python literals in the scaling expression. Main plan stays pure per-row →
+  streams cleanly.
+- **Verified end-to-end** inside the Docker container on the 3 GB `_full.parquet`.
+- **Body docs updated:** "Pipeline" section above rewritten to describe the
+  new flow.
+
+### 2026-06-25 — neural_network.py: PyTorch rewrite with survey-weighted BCE
+- **Replaced `sklearn.neural_network.MLPClassifier` with a PyTorch MLP.** Same
+  `(128, 64, 32)` hidden shape, single-logit output, same binary
+  cross-entropy objective — but survey weights now enter the loss directly
+  instead of via a weighted bootstrap.
+- **Why:** sklearn's MLPClassifier accepts neither `sample_weight` nor
+  `class_weight`. The previous version worked around this by resampling rows
+  with `np.random.choice(p=...)` — effective in expectation but indirect, and
+  noisy at large `n`.
+- **Survey-weighted BCE** (`weighted_bce_loss`) lifted verbatim from
+  `../../SDSI496/classifier.py`:
+  ```python
+  bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+  return (bce * sample_weights).sum() / sample_weights.sum()
+  ```
+  Per user directive, only this function was taken — the rest of that
+  reference file (reservoir sampling, k-fold, sweep harness) is unrelated and
+  not borrowed.
+- **Variant semantics preserved.** Both variants get `compute_sample_weight
+  ("balanced", y)` folded into the per-sample weight tensor, matching LR's
+  `class_weight="balanced"` and XGB's `scale_pos_weight` behavior. The
+  `survey_weighted` variant additionally multiplies by `State population`. The
+  `standard` variant uses uniform population weights (only class balance).
+- **MLflow swap:** `mlflow.sklearn.log_model / load_model` →
+  `mlflow.pytorch.log_model / load_model`. Existing experiment dir still
+  holds the old sklearn-era LoggedModels; test mode picks the most recent by
+  `creation_timestamp DESC` as before, so the first PyTorch run will be the
+  one loaded.
+- **Hyperparams:** `EPOCHS=200`, `BATCH_SIZE=1024`, `LR=1e-3`, Adam. 200
+  epochs in PyTorch is meaningfully more work than sklearn's `max_iter=200`
+  (which early-stops on plateau by default) — expect noticeably longer
+  training. Tune down or add validation-loss early-stop if it drags.
+- **CUDA-aware** via `torch.device("cuda" if torch.cuda.is_available() else
+  "cpu")`. No-op on the current Mac host; will activate inside a CUDA-enabled
+  container without code changes.
+- **`requirements.txt`:** `torch` added (unpinned, first install resolves the
+  version).
+- **Not yet verified end-to-end.** Rebuild the Docker image (new dep) and run
+  `python neural_network.py --mode train ...` then `--mode test ...` before
+  trusting it.
+
+### 2026-06-25 — model scripts: output parquet is label + predictions only
+- **All three model scripts** (`logistic_regression.py`, `xgb.py`,
+  `neural_network.py`) now write only `{TARGET, predicted_disability_standard,
+  predicted_disability_survey_weighted}` in test mode. The full feature
+  frame is no longer copied through.
+- **Was:** `df.with_columns([pl.Series(n, v) for n, v in
+  out_cols.items()]).write_parquet(out)` — preserved every input feature
+  plus the new predictions, producing a wide output.
+- **Now:** `pl.DataFrame({TARGET: y, **out_cols}).write_parquet(out)` — three
+  columns total.
+- **Why:** features are losslessly reproducible from the input parquet;
+  carrying them through bloated the labeled output and added nothing
+  actionable. Predictions are joinable back to features via row order if a
+  downstream consumer needs the full frame.
+- **Backward compat:** any consumer expecting the old wide labeled parquet
+  will need to re-attach features via row index. None known so far.
+
+### 2026-06-25 — Dockerfile + filename: copy nn/xgb, logstic→logistic rename
+- **Dockerfile `COPY` line** updated to include `neural_network.py` and
+  `xgb.py` so all three model drivers run inside the container without
+  bind-mounting.
+- **File rename:** `logstic_regression.py` → `logistic_regression.py`. Done
+  by the user out of band; the Dockerfile already reflects the new name. The
+  earlier "typo'd `logstic_` is intentional" rule (2026-06-10 changelog
+  entry) is **superseded** — only the directory typo (`ml_pipline`) remains
+  intentional. Historical changelog entries that reference
+  `logstic_regression.py` are kept verbatim per the entries-are-historical
+  rule; new edits should use `logistic_regression.py`.
+- **Rebuild required** to pick up both the new `COPY` line and the `torch`
+  dependency. Code-only edits still iterable via bind mount (`-v
+  $(pwd):/app`).
+
+### 2026-06-15 — add xgb.py (XGBoost, control + treatment)
+- **New file `xgb.py`**, structurally a mirror of `logstic_regression.py` per
+  user directive ("same iterative code ... except for model specifics"). Same
+  CLI (`--mode {train,test}`, `--threshold`, one positional `input`), same
+  MLflow logging shape (`train_unweighted_*` / `train_weighted_*` /
+  `test_unweighted_*` / `test_weighted_*` + matching param dicts), same
+  model-loading path (LoggedModel name = variant, `search_logged_models`
+  ordered by `creation_timestamp DESC`), same two variants (`standard`,
+  `survey_weighted`). Control/treatment contrast is the iid-vs-survey-weighted
+  framing from Kim (2020) — same as LR and NN scripts.
+- **Filename is `xgb.py`, not `xgboost.py`.** User-confirmed after I flagged
+  that `xgboost.py` would shadow the installed `xgboost` PyPI package on
+  `python xgboost.py` invocation (`from xgboost import XGBClassifier` resolves
+  to the script itself, recursive import). Don't rename to `xgboost.py`.
+- **Model:** `xgboost.XGBClassifier(n_estimators=200, max_depth=6,
+  learning_rate=0.1, tree_method="hist", objective="binary:logistic",
+  eval_metric="logloss", n_jobs=-1, scale_pos_weight=...)`. Modest defaults,
+  no tuning yet — left for future iteration.
+- **Class imbalance via `scale_pos_weight`** computed as
+  `(y == 0).sum() / max((y == 1).sum(), 1)`. This is XGBoost's analogue of
+  LR's `class_weight="balanced"` — the per-positive gradient is multiplied by
+  this factor, so the ~12% positive-rate target gets a ~7.2× lift. Logged as
+  a param so it's traceable. Survey-weighted variant *also* passes
+  `sample_weight=w` to `.fit()`, so the effective per-row weight is
+  `state_population[i] * scale_pos_weight` on positives — same multiplicative
+  stack as the LR script.
+- **Persistence via `mlflow.xgboost`** (`log_model` / `load_model`) rather
+  than `mlflow.sklearn`. Functionally parallel — both write LoggedModel
+  entries under `mlruns/<exp>/models/m-*/` and load back via `models:/<id>`.
+  `XGBClassifier` is still the sklearn-API wrapper, so `predict_proba` etc.
+  behave identically to LR's interface.
+- **Different experiment name:** `EXPERIMENT = "xgboost_survey_weights"` so
+  XGBoost runs don't share the LR or NN experiment dir / model namespace.
+  Test mode looks up models in this experiment only.
+- **Different output suffix:** test mode writes
+  `<input-stem>_labeled_xgb.parquet`, parallel to NN's `_labeled_nn.parquet`
+  and LR's `_labeled.parquet`. All three can run on the same input without
+  clobbering each other.
+- **`requirements.txt` updated** — `xgboost` added (unpinned). The host venv
+  doesn't have it installed yet; first `pip install` (or `docker build`)
+  resolves the version, pin afterward to match the existing
+  pinned-to-host-versions convention.
+- **Not yet verified end-to-end.** Script is structurally a port of the LR
+  driver — same CLI, same MLflow surface, same load path. Run inside the
+  Docker container (`python xgb.py --mode train data/train_processed.parquet`
+  then `--mode test`) after rebuilding the image to pick up the new
+  `xgboost` dep. Should be fast — `tree_method="hist"` on 250K × ~548 with
+  200 trees runs in a couple minutes per variant.
+
+### 2026-06-15 — add neural_network.py (3-layer MLP, control + treatment)
+- **New file `neural_network.py`**, structurally a mirror of
+  `logstic_regression.py` per user directive ("same iterative code ... except
+  for model specifics"). Same CLI (`--mode {train,test}`, `--threshold`, one
+  positional `input`), same MLflow logging shape (`train_unweighted_*` /
+  `train_weighted_*` / `test_unweighted_*` / `test_weighted_*` + matching
+  param dicts), same model-loading path (LoggedModel name = variant,
+  `search_logged_models` ordered by `creation_timestamp DESC`), same two
+  variants (`standard`, `survey_weighted`).
+- **Model:** `sklearn.neural_network.MLPClassifier(hidden_layer_sizes=(128, 64, 32),
+  max_iter=200, random_state=42)`. Three hidden layers, adam solver (sklearn
+  default), no extra hyperparam tuning yet — left for future iteration.
+- **Survey-weight + class-balance handling via weighted bootstrap.** Unlike
+  `LogisticRegression`, `MLPClassifier.fit()` accepts neither `sample_weight`
+  nor `class_weight`. To get the same effect for both variants the script
+  resamples rows with `np.random.default_rng(SEED).choice(n, size=n,
+  replace=True, p=combined/combined.sum())` where `combined =
+  compute_sample_weight("balanced", y) * (w if survey_weighted else 1)`.
+  - Standard variant: equivalent in expectation to `class_weight="balanced"`
+    on the original rows (no survey weights).
+  - Survey-weighted variant: equivalent in expectation to
+    `class_weight="balanced"` *and* `sample_weight=w` stacked the same way
+    they stack in the LR script (`class_weight × sample_weight`). Faithful
+    to Kim (2020) Eq. 1 generalization — treatment group uses survey
+    weights for both fit and metric calc; control uses neither.
+- **Different experiment name:** `EXPERIMENT = "neural_network_survey_weights"`
+  so NN runs don't share the LR's experiment dir / model namespace. Test
+  mode looks up models in this experiment only.
+- **Different output suffix:** test mode writes
+  `<input-stem>_labeled_nn.parquet` (LR writes `<input-stem>_labeled.parquet`)
+  so both scripts can run on the same input without clobbering each other.
+- **MLflow file-store quirks** (FAT32 / ExFAT AppleDouble, file-store
+  maintenance-mode env var, tracking URI computation) are handled identically
+  to `logstic_regression.py`. No new env knobs.
+- **Not yet verified end-to-end.** Script is structurally a port of the LR
+  driver — same CLI, same MLflow surface, same load path. Run inside the
+  Docker container (`python neural_network.py --mode train
+  data/train_processed.parquet` then `--mode test`) before relying on it.
+  Heavier than LR — adam on 250K × ~548 features × 3 hidden layers will
+  take noticeably longer per variant.
+
+### 2026-06-15 — logstic_regression.py: class_weight=balanced + --threshold flag
+- **Train mode: `LogisticRegression(class_weight="balanced", ...)` for both
+  variants** (logstic_regression.py:74-76). The 12% positive-rate target
+  was collapsing the model to the majority-class baseline (acc ≈ 0.879,
+  recall ≈ 0.002 on the train set). `class_weight="balanced"` reweights
+  the loss so each class contributes equally — effectively a ~7.2×
+  multiplier on positive-class rows. Logged as a param so the change is
+  traceable in mlflow.
+- **For `survey_weighted`, `class_weight` and `sample_weight` stack
+  multiplicatively** in sklearn. The effective per-row weight is now
+  `state_population[i] * class_weight[y[i]]` — that's the intended
+  behavior (population-representative *and* class-balanced fitting), but
+  worth knowing if results look odd.
+- **Test mode: new `--threshold FLOAT` flag** (default `0.5`). Replaces
+  `clf.predict(X)` with `(clf.predict_proba(X)[:, 1] >= threshold)`, so
+  the operating point is tunable post-hoc without retraining. Threshold
+  is logged as a param on the test run so each evaluation is
+  self-describing.
+- **Verified end-to-end inside Docker** (script mounted live via `-v`):
+  retrained both variants, then swept threshold ∈ {0.3, 0.5, 0.7} on the
+  train parquet:
+  | threshold | variant         | precision | recall | positives |
+  |-----------|-----------------|-----------|--------|-----------|
+  | 0.3       | standard        | 0.132     | 0.960  | 221,080   |
+  | 0.5       | standard        | 0.184     | 0.607  | 100,144   |
+  | 0.5       | survey_weighted | 0.176     | 0.639  | 109,827   |
+  | 0.7       | standard        | 0.299     | 0.141  | 14,363    |
+  Recall on the un-balanced baseline was ~0.002; the lift comes almost
+  entirely from `class_weight="balanced"`, with `--threshold` giving
+  smooth control between the precision/recall corners.
+- **Old models still in `mlruns/`.** The pre-balanced LoggedModels from
+  the earlier train remain in `mlruns/<exp>/models/`; test mode picks up
+  the newest by `creation_timestamp DESC`, so it'll grab the balanced
+  ones automatically. Delete the old `m-aec7f27.../` and `m-d644f16.../`
+  dirs if you want a clean slate.
+- **`README.md` updated** to show `--threshold 0.5` in the Run section
+  as a hint that the flag exists; default is unchanged.
+
+### 2026-06-15 — logstic_regression.py: train run_name -> {variant}_train
+- Train mode now opens its mlflow run with `run_name=f"{variant}_train"`
+  (was `run_name=variant`), so train/test runs are symmetric in the UI:
+  `standard_train` / `standard_test`, `survey_weighted_train` /
+  `survey_weighted_test`.
+- **Safe re: model loading.** Test mode finds models by LoggedModel name
+  (`name='{variant}'`, set on `mlflow.sklearn.log_model(clf, name=variant)`),
+  not by run name — so renaming the run doesn't change how
+  `search_logged_models` resolves the artifact. The 2026-06-11 model-loading
+  fix is untouched.
+- **Existing runs are not retroactively renamed.** The two runs already in
+  `mlruns/` from the prior train (`standard`, `survey_weighted`) keep their
+  original `run_name`. Only future train runs get the `_train` suffix.
+
+### 2026-06-15 — mlflow UI port 5000 → 5001
+- **Port 5000 was taken on the user's host** (likely macOS AirPlay
+  Receiver, the usual culprit). Switched everything that references the
+  mlflow UI port to **5001**: `Dockerfile` `EXPOSE`, the `docker run -p`
+  flag and `mlflow ui --port` invocation in both `README.md` and the
+  "Running it" block in this file, and the prose "port 5000 exposed"
+  note. Prior changelog entries that mention 5000 are kept verbatim per
+  the historical-entries rule.
+- **Rebuild is not strictly required.** `EXPOSE` is documentation only;
+  the actual binding is the `-p 5001:5001` flag on `docker run`, and
+  `mlflow ui --port 5001` is what binds inside the container. The
+  existing image still works as long as you pass the new `-p` and
+  `--port` values. Rebuild only if you want the `EXPOSE` metadata in
+  sync (e.g., for `docker inspect` / image-listing readability).
+
+### 2026-06-15 — logstic_regression.py: log test-mode metrics to mlflow
+- **Test mode now opens a new mlflow run per variant** (`{variant}_test` run
+  name, same experiment as training) and logs the unweighted + weighted
+  versions of accuracy / precision / recall / F1 / ROC-AUC under the
+  `test_unweighted_*` / `test_weighted_*` prefixes — mirroring the train
+  mode's `train_*` schema so the UI shows train vs test metrics on the
+  same axes. Params logged: `variant`, `model_uri` (the `models:/...` URI
+  that was loaded), `input`, `n_rows`, `n_features`. **Why:** user wants
+  test-mode runs to be a record of held-out model evaluation, not just a
+  prediction-writing convenience.
+- **Moved `y = df[TARGET].to_numpy()` to the module-top loading block**
+  (next to `X` and `w`). It was previously train-only; now both modes need
+  it for metric computation. The script still requires the target column
+  to be present in the input parquet — that was already true for train
+  and is now enforced for test too. If you later need to score truly
+  unlabeled data, the no-metrics path would need to come back as a
+  separate flag.
+- **Verified end-to-end** by mounting the live script into the container
+  (`docker run -v ./logstic_regression.py:/app/logstic_regression.py
+  ml_pipeline python logstic_regression.py --mode test
+  data/train.parquet`) and confirming via `MlflowClient.search_runs` that
+  `standard_test` and `survey_weighted_test` runs landed with all ten
+  metrics each. Numbers matched the corresponding train runs because the
+  test was run on the train parquet itself; they'll diverge on a
+  held-out file.
+- **Rebuild reminder:** the existing `ml_pipeline:latest` image is from
+  the prior Dockerfile build and still has the old script COPY'd in. Run
+  `docker build -t ml_pipeline .` to pick up this change, or mount the
+  script via `-v` (as in the verification command above) for iteration.
+
+### 2026-06-15 — README.md: add Run section with per-parquet command flow
+- Added a "Run" section showing the four commands (preprocess → train → test
+  → `mlflow ui`) to execute from the container shell against a parquet
+  dropped into `./data/`. Build + Start sections unchanged. Style matches
+  the prior pass: short, no per-flag prose, defers to `CLAUDE.md` for
+  rationale.
+
+### 2026-06-11 — fix test-mode model loading for MLflow 3 logged-model layout
+- **Bug:** test mode crashed with `MlflowException: Failed to download
+  artifacts from path 'model'`. `mlflow.sklearn.log_model(clf, name="model")`
+  in MLflow 3 routes the model to the experiment-level
+  `mlruns/<exp>/models/m-<id>/artifacts/` store as a first-class
+  Logged Model, not under the run's `artifacts/`. The run dir only keeps a
+  pointer in `outputs/m-<id>/meta.yaml`. The old `runs:/<run_id>/model` URI
+  resolves to `<run.artifact_uri>/model` (= `<run>/artifacts/model`), which
+  is empty under this layout — hence the load failure.
+- **Fix:** log each variant under its variant name
+  (`mlflow.sklearn.log_model(clf, name=variant)`) so the two LoggedModels
+  are distinguishable, and load in test mode via
+  `client.search_logged_models(experiment_ids=[...], filter_string=f"name='{variant}'", order_by=[{"field_name":"creation_timestamp","ascending":False}], max_results=1)`
+  → `models:/{model.model_id}`. Hard-errors with `SystemExit` if no
+  LoggedModel of that name exists, matching the existing experiment-missing
+  behavior.
+- **Why the prior changelog's "Verified end-to-end on synthetic data" entry
+  did not catch this:** kept verbatim per the entries-are-historical rule,
+  but treat it as superseded. Current end-to-end was re-verified after this
+  fix against the real 250K-row `data/train.parquet` (train logs two
+  variants → test loads `models:/m-...` → writes `data/train_labeled.parquet`
+  with both `predicted_disability_*` columns). The full
+  `docker build → docker run train → docker run test → mlflow ui` flow is
+  now working from the bind-mounted `./mlruns/`.
+- **Observed but not fixed (separate concern):** both variants predict the
+  positive class on only ~0.05% of rows vs ~12% actual positive rate, so
+  the train-set "accuracy" of 0.879 is just the majority-class rate. Likely
+  a class-imbalance / regularization issue (default `lbfgs`, no
+  `class_weight`); not a load-path bug. Worth investigating separately
+  before treating these models as useful.
+- **AppleDouble note:** `._MLmodel`, `._model.pkl`, `._conda.yaml`, etc.
+  reappear inside the freshly-written `models/m-*/artifacts/` directory the
+  moment the container writes to the ExFAT bind mount. Not blocking
+  loading via `models:/` (mlflow looks for `MLmodel` by exact name), but it
+  will trip `mlflow ui` if/when it scans artifacts. Quirk 1 cleanup mantra
+  still applies; the `MLFLOW_TRACKING_URI=file://$HOME/...` escape hatch
+  remains the documented fallback.
+
+### 2026-06-11 — add README.md (Docker-focused user guide)
+- **New file `README.md`** at user request: build, start, run scripts +
+  `mlflow ui`, rebuild after edits. Initially written long with per-flag
+  explanations and an end-to-end flow block; user pushed back to simplify
+  and de-AI-ify, so the current version drops the "What's in the image"
+  section (versions live in `requirements.txt`), the flag-by-flag
+  breakdown of `docker run`, the duplicated typical-flow block, and the
+  `MLFLOW_TRACKING_URI` override section. Points at `CLAUDE.md` for
+  context so the two files don't duplicate decision history.
+
+### 2026-06-11 — re-add Docker (single-stage, bash CMD, mlflow UI on :5000)
+- **New files:** `Dockerfile`, `.dockerignore`, `requirements.txt`. User asked
+  for containerization so they can run scripts manually inside the image and
+  hit the mlflow UI from the host browser; reproducibility is the other
+  driver. Shape matches the guidance left in the prior "No Docker for now"
+  entry: single-stage `python:3.12-slim`, no compose, bind-mount `./data` and
+  `./mlruns` at runtime, exclude `.venv` / `data/` / `mlruns/` / `._*` /
+  `__pycache__` / `.git` / `.claude` / `eda.ipynb` / `CLAUDE.md` from the
+  build context.
+- **`CMD ["bash"]`, no ENTRYPOINT.** User runs scripts manually, so the
+  container drops into a shell. Both `data_processing.py` and
+  `logstic_regression.py` are COPY'd to `/app/`; nothing is auto-executed.
+- **`ENV MLFLOW_ALLOW_FILE_STORE=true`** baked into the image. The
+  `logstic_regression.py` script sets this via `os.environ.setdefault`, but
+  running `mlflow ui` directly from the shell would otherwise hit MLflow's
+  "file store in maintenance mode" refusal. Setting it at the image level
+  makes both the script and the UI work without env juggling.
+- **Port 5000 exposed.** `mlflow ui` must be launched with `--host 0.0.0.0`
+  inside the container to be reachable from the host browser — documented in
+  both "Running it" and "Don't".
+- **`requirements.txt` pinned to host-installed versions** (`polars==1.6.0`,
+  `pyarrow==24.0.0`, `mlflow==3.13.0`, `scikit-learn==1.9.0`,
+  `numpy==2.4.6`). Verified inside the built image: imports succeed and
+  version strings match the host venv exactly.
+- **`logstic_regression.py`'s tracking URI behavior is preserved.** The script
+  computes `Path(__file__).resolve().parent / 'mlruns'`, which inside the
+  container resolves to `/app/mlruns/` — bind-mounted to host `./mlruns/`, so
+  existing runs persist and remain viewable from both sides. The
+  `MLFLOW_TRACKING_URI=file://$HOME/...` APFS escape hatch (see the
+  TRACKING_URI-relocation entry below) still works inside the container —
+  point it at a path that's *not* on the bind-mounted external drive.
+- **Build gotcha hit during verification:** the first `docker build` failed
+  with `error from sender: failed to xattr ._.dockerignore: operation not
+  permitted`. AppleDouble sidecars on ExFAT (Quirk 1) — `find . -name '._*'
+  -type f -delete`, then rebuild. Worth keeping in muscle memory; the
+  `.dockerignore` excludes `._*` but the *sender* errors on them before
+  reading the ignore file.
+- **CLAUDE.md updates:** added the file/layout, added "Docker" run path under
+  "Running it", flipped the "No Docker for now" decision to "Docker is back"
+  with the canonical shape, replaced the "Don't re-add Docker" warning with
+  new don'ts targeting the failure modes most likely to crop up (compose,
+  baking data into the image, binding mlflow UI to localhost).
+
+### 2026-06-11 — external drive reformatted FAT32 → ExFAT
+- **User reformatted `/Volumes/ExtDrive` from MS-DOS FAT32 to ExFAT.** Live
+  guidance in this file and in `../data_pipeline/CLAUDE.md` (quirk 28, mode
+  warnings, the "Don't switch back to SNAPPY" rule) was updated to reflect
+  the new filesystem. Prior changelog entries are kept verbatim — they
+  describe what was true at the time of writing.
+- **What this changes:**
+  - 4 GB single-file cap is gone. `data_pipeline` `test` mode is no longer
+    blocked at the concat step; `_extract_cache/` and `_full.parquet` can
+    grow freely (watch free space instead).
+  - SQLite locking on the data drive *should* work now (ExFAT supports file
+    locking; FAT32 did not). The mlflow file-store backend is still the
+    pinned choice — the SQLite-on-FAT32 gotcha (see the 2026-06-10 mlflow
+    changelog entry below) is the reason the file backend was pinned in the
+    first place. Don't flip back to SQLite without testing.
+- **What does NOT change:**
+  - macOS still writes `._*` AppleDouble sidecars on ExFAT (no xattr
+    support on either FS). Quirk 1 cleanup mantra still applies. The
+    mlflow `UnicodeDecodeError` failure mode noted in the
+    `TRACKING_URI`-relocation changelog entry below is therefore still a
+    live risk; the escape hatch (`MLFLOW_TRACKING_URI=file://$HOME/...`)
+    still works.
+  - `.pyc` corruption (quirk 12) was a FAT32-specific symptom in practice
+    but the cleanup is cheap; keep doing it until proven unnecessary.
+
+### 2026-06-11 — logstic_regression.py: move mlflow tracking store into ml_pipeline/mlruns
+- **Changed `TRACKING_URI` default** from `file://$HOME/mlruns_ml_pipline`
+  (APFS) to `file://<script_dir>/mlruns` (i.e. `ml_pipeline/mlruns/` on the
+  FAT32 external drive). Computed via `Path(__file__).resolve().parent /
+  'mlruns'` so it tracks the script regardless of cwd.
+  - **Why:** user wants the tracking store colocated with the rest of the
+    project so runs / artifacts / experiments live alongside the code that
+    produced them, rather than sprayed into `$HOME`.
+  - **Known risk (FAT32 / AppleDouble):** the prior reason the store lived on
+    APFS was that macOS writes `._*` sidecars onto FAT32 and the mlflow file
+    backend crashes reading them as tags (`UnicodeDecodeError`). User accepted
+    this risk. If runs start crashing with a UnicodeDecodeError, run
+    `find ml_pipeline/mlruns -name '._*' -delete` and retry; if it keeps
+    recurring mid-run, fall back to `MLFLOW_TRACKING_URI=file://$HOME/...`
+    via env var (the env override still works).
+- **No code change to the override path** — `MLFLOW_TRACKING_URI` still wins
+  if set, so the APFS escape hatch is one env var away.
+
+### 2026-06-11 — logstic_regression.py: mlflow.sklearn for model persistence; style pass
+- **Dropped joblib + `./models/` directory.** Models are now logged via
+  `mlflow.sklearn.log_model(clf, name="model")` in train mode. Test mode finds
+  the most recent run for each variant by `run_name` tag and loads with
+  `mlflow.sklearn.load_model("runs:/<run_id>/model")`. `joblib` is gone from
+  the imports; the mlflow tracking store is now the single source of truth for
+  fitted models.
+  - **Why:** user directive — keep model persistence inside mlflow rather than
+    a parallel `./models/` tree.
+  - **No model registry** because the file-store backend on this project
+    doesn't reliably support it; `MlflowClient.search_runs` ordered by
+    `start_time DESC` with `filter_string="tags.\`mlflow.runName\` = '<variant>'"`
+    is the lookup mechanism. If you move to a SQL backend later, swap this for
+    `models:/<name>/<stage>`.
+  - Test mode now hard-errors if the experiment or a variant's run is missing
+    (`raise SystemExit`) rather than silently looking for a local file.
+- **Style pass / un-AI-ifying.** Trimmed the verbose top docstring, dropped
+  `[train]` / `[test]` print prefixes, renamed `TARGET_POS` → `TARGET`,
+  `TARGET_NEG` stays, `metrics()` → `score()`, removed the redundant
+  `mode: "train"` log_param (already implied by the script), and inlined the
+  `.fit()` chain. Behavior is unchanged.
+- **Verified end-to-end on synthetic data.** Generated a 2000-row parquet
+  matching the data_processing.py output schema (6 float feats, 12 dummy
+  feats, `State population`, the two Disability dummies) with a correlated
+  target; both train variants logged cleanly, test mode loaded both back and
+  wrote a `_labeled.parquet` with both prediction columns. Predictions agreed
+  ~98% between standard and survey_weighted, as expected for a
+  uncorrelated-with-state-pop synthetic target.
+
+### 2026-06-10 — train/test modes for logstic_regression.py, drop scaling on State population
+- **`data_processing.py`**: excluded `"State population"` from the MinMax
+  scaling pass. The column now passes through with its raw integer values
+  (~37M for the largest state) so it can be used directly as a survey
+  weight downstream. All other numeric columns are still scaled to `[0, 1]`.
+  **Why:** the upstream parquet has no `PWGTP`; `State population` is the
+  best available survey weight, but scaling it to `[0, 1]` (a) sent the
+  smallest-population state's weight to 0 and (b) forced the messy
+  `WEIGHT_FLOOR = 1e-3` hack in the training script.
+- **`logstic_regression.py`**: substantial rewrite.
+  - **New `--mode {train,test}` CLI flag.** Both modes share the same input
+    layout (parquet from `data_processing.py`) but diverge in what they do
+    with it.
+    - `train`: fits both `standard` and `survey_weighted` LogisticRegression
+      on the full input (no CV), logs params + train-set metrics to MLflow,
+      pickles both estimators to `./models/{standard,survey_weighted}.joblib`.
+    - `test`: loads both models from `./models/`, scores the input parquet,
+      appends `predicted_disability_standard` and `predicted_disability_survey_weighted`
+      columns, writes to `./data/<input-stem>_labeled.parquet`.
+  - **Dropped 5-fold StratifiedKFold CV.** Per user, the train mode is for
+    fitting + persisting; held-out evaluation lives elsewhere (or in test
+    mode against a held-out parquet). MLflow logging is simpler now: one run
+    per variant, no `step=fold`, metrics are train-set only.
+  - **Removed `WEIGHT_FLOOR`.** `State population` is no longer MinMax-scaled
+    so the smallest-population state no longer rounds to 0, and the floor
+    became unnecessary.
+  - **Added `joblib` to the runtime deps** (it ships with sklearn, no
+    separate install). Models are pickled via `joblib.dump` and logged as
+    MLflow artifacts so they're discoverable both at `./models/` and inside
+    the run dir.
+  - Script prints a layout summary of the MLflow file-store tree at end of
+    train mode (experiment dir → run dir → params/metrics/tags/artifacts)
+    so it's obvious what got written and where.
+- **CLAUDE.md**: updated pipeline step 5 to note the `State population`
+  exclusion. Prior changelog entries kept verbatim for history (the
+  WEIGHT_FLOOR / CV writeup below describes the previous shape of the
+  script; the rationale for both has now been dissolved by this change).
+
+### 2026-06-10 — add logstic_regression.py (MLflow + survey-weighted CV)
+- **New file `logstic_regression.py`** (typo'd `logstic_` is intentional, per
+  user — matches the `ml_pipline` directory typo convention). Trains two
+  logistic regressions on the processed parquet under 5-fold stratified CV:
+  `standard` (no per-sample weights) and `survey_weighted` (survey weights
+  passed via sklearn's `sample_weight` in `.fit()`). Logs both unweighted and
+  survey-weighted versions of accuracy / precision / recall / F1 / ROC-AUC to
+  MLflow per Kim (2020), "Machine Learning Model Selection with Complex
+  Sample Survey Data" — Eq. 1 (weighted CV accuracy) generalized to
+  `metric_cv^w = sum_j f(A; D^w \ D_j^w, D_j^w)`.
+- **Target**: `Disability (recoded)_With a disability` (binary, ~12% positive
+  on the 250K test parquet). Both Disability dummies + the weight column are
+  dropped from features.
+- **Survey weight**: `State population` + `1e-3` floor. **Why:** the
+  processed parquet has no `PWGTP` — the original PUMS person-weight column
+  isn't in `data_pipeline/data/manual__*/synth/_full.parquet` (only
+  `state_population` is). `State population` is MinMax-scaled to `[0, 1]` by
+  `data_processing.py`, so the smallest-population state would have weight 0
+  and be dropped from both the weighted loss and weighted metrics. The
+  `1e-3` floor avoids that without materially changing the relative weight
+  structure. **If you later preserve PWGTP through the pipeline, switch
+  `WEIGHT_COL` to it and drop the floor.**
+- **MLflow** (three FAT32-related gotchas, all worked around in the script):
+  1. MLflow 3.x defaults to a **SQLite** backend; SQLite locking is broken on
+     FAT32 (`sqlite3.OperationalError: attempt to write a readonly database`).
+     → Script pins a file: backend explicitly.
+  2. MLflow 3.x refuses the file backend by default ("in maintenance mode"). →
+     Script sets `MLFLOW_ALLOW_FILE_STORE=true` before `import mlflow`.
+  3. macOS writes AppleDouble (`._*`) sidecars onto FAT32; the file store
+     reads every file in a run dir as a "tag", crashing with
+     `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb0`. Cleaning
+     `._*` doesn't help — the OS recreates them mid-run. → Script writes
+     the tracking store to `$HOME/mlruns_ml_pipline` (APFS), not the project
+     dir. Override with `MLFLOW_TRACKING_URI` if needed.
+
+  Experiment name: `logistic_regression_survey_weights`, one run per variant.
+  Per-fold metrics logged with `step=fold`; aggregates logged as
+  `{kind}_{name}_mean` / `_std`.
+- **Adds `mlflow` (3.13) as a runtime dep** alongside `polars` + `sklearn`.
+  Installed into the existing `.venv`; not pinned in any requirements file
+  yet (none exists in this folder).
+- **Doesn't break the "one output file" or "no functions" conventions** —
+  this is a new model-training entry point, not a modification to
+  `data_processing.py`. The script defines one helper (`fold_metrics`)
+  because the same dict-of-metrics computation is called twice per fold
+  (unweighted + weighted); inlining it twice would duplicate five lines.
+- **Running it**:
+  ```bash
+  .venv/bin/python logstic_regression.py /abs/path/to/train.parquet
+  .venv/bin/mlflow ui   # to browse mlruns/
+  ```
+
+### 2026-06-10 — drop DATA_DIR, accept raw paths
+- **`data_processing.py`**: removed `DATA_DIR = "./data"` and the `f"{DATA_DIR}/..."`
+  prefixing on both read and write. `args.input` / `args.output` are now passed
+  straight to `pl.read_parquet` / `df.write_parquet`. **Why:** user directive —
+  callers should pass raw paths (relative or absolute), not filenames implicitly
+  resolved under `./data/`.
+- **`CLAUDE.md`**: pipeline step 7 and "Running it" updated to drop the
+  `./data/` resolution note.
+
+### 2026-06-10 — remove Docker
+- Deleted `Dockerfile`, `.dockerignore`, `requirements.txt`. **Why:** user
+  reverted the Docker addition from earlier in the same session. The local
+  venv path is the only supported run mode for now.
+- `CLAUDE.md` body updated to remove Docker layout / running instructions;
+  prior changelog entry for the Docker addition kept for history.
+
+### 2026-06-10 — polars swap + Docker setup
+- **`data_processing.py`**: swapped `pandas` + `sklearn.preprocessing.MinMaxScaler`
+  → `polars` + inline `(col - col.min()) / (col.max() - col.min())`. Same
+  output shape (250K × 548), same semantics. Drops sklearn from the runtime
+  deps. **Why:** user directive — match `data_pipeline`'s polars stack and
+  reduce dependency surface.
+- **Added `Dockerfile`** (python:3.12-slim + polars 1.6 + pyarrow 17, ENTRYPOINT
+  on the script), **`requirements.txt`**, and **`.dockerignore`** (excludes
+  `.venv`, `data/`, `._*`, `__pycache__`). **Why:** user wants the pipeline
+  containerized. No docker-compose — single-service script, compose would be
+  noise. Image build wasn't verified in this session (Docker daemon not
+  running); Dockerfile is standard enough that build should succeed once
+  daemon is up. **(Removed later in the same session — see entry above.)**
+- **`CLAUDE.md`** reorganized to include the Changelog section per the new
+  user convention: every edit to `ml_pipline/**` gets logged here.

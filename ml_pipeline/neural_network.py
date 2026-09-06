@@ -1,8 +1,10 @@
 """
     python neural_network.py data/test.parquet
-    python neural_network.py --train-test-cycles 10 --search-trials 15 data/test.parquet
+    python neural_network.py --resample-rounds 10 --search-trials 15 data/test.parquet
 
-Each of --train-test-cycles cycles samples 5000 rows per state, splits that sample into
+Repeated random subsampling (Monte Carlo CV), NOT k-fold: each of --resample-rounds
+rounds independently resamples 5000 rows per state (fresh seed), so rounds overlap
+rather than partition. Each round splits its sample into
 200k train / 50k test, fits the model on train (random search + refit, logging
 unweighted + weighted train metrics), logs unweighted + weighted metrics on the
 50k test split, then logs unweighted metrics on the rest of the population
@@ -41,7 +43,7 @@ TEST_SIZE = 50_000  # held-out test split carved out of the per-state sample
 BATCH_SIZE = 8192
 EPOCHS = 15
 SEARCH_TRIALS = 15
-TRAIN_TEST_CYCLES = 5
+RESAMPLE_ROUNDS = 5
 VAL_FRAC = 0.1
 SEED = 42
 LR = 1e-3
@@ -57,9 +59,11 @@ p.add_argument("--threshold", type=float, default=None,
                help="decision threshold; default: each variant's learned best_threshold")
 p.add_argument("--search-trials", type=int, default=SEARCH_TRIALS,
                help="random-search trials per variant (default %(default)s)")
-p.add_argument("--train-test-cycles", type=int, default=TRAIN_TEST_CYCLES,
-               help="cycles, each on a fresh 5000-per-state sample split "
-                    "200k train / 50k test (default %(default)s)")
+p.add_argument("--resample-rounds", type=int, default=RESAMPLE_ROUNDS,
+               help="repeated random subsampling rounds (Monte Carlo CV, NOT "
+                    "k-fold); each round independently draws a fresh "
+                    "5000-per-state sample split 200k train / 50k test "
+                    "(default %(default)s)")
 p.add_argument("input")
 args = p.parse_args()
 
@@ -166,7 +170,7 @@ n_rows = state_id.shape[0]
 state_indices = [np.where(state_id == s)[0] for s in range(len(STATE_COLS))]
 
 
-for it in range(args.train_test_cycles):
+for it in range(args.resample_rounds):
     rng_sample = np.random.default_rng(SEED + it)
     sample_idx = np.concatenate([
         rng_sample.choice(idx, size=min(PER_STATE, len(idx)), replace=False)
